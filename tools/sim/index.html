@@ -13,22 +13,25 @@
   .wrap { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
   .panel { background:#0c1222; border:1px solid #28344e; border-radius:10px; padding:12px; }
   canvas#lcd { width:340px; height:640px; image-rendering:pixelated; background:#080c18; border:1px solid #28344e; border-radius:6px; touch-action:none; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; align-items:center; }
   button { background:#16203a; color:#d8e2f4; border:1px solid #33415e; border-radius:6px; padding:6px 10px; font:inherit; font-size:12px; cursor:pointer; }
   button:hover { border-color:#7e94b4; }
   button.active { border-color:#46eb37; color:#b2ffa0; }
   button.boot { font-size:15px; padding:14px 18px; border-width:2px; user-select:none; -webkit-user-select:none; }
   button.boot.held { background:#12330f; border-color:#46eb37; color:#b2ffa0; }
+  button.recv { border-color:#7e5a1e; }
   input[type=text] { background:#0a0f1e; color:#fff; border:1px solid #33415e; border-radius:6px; padding:6px 8px; font:inherit; font-size:12px; width:220px; }
   .meta { font-size:12px; color:#9fb4d8; white-space:pre-wrap; }
   .meta b { color:#fff; }
-  .hint { font-size:11px; color:#5c6b86; max-width:420px; line-height:1.5; }
+  .badge { display:inline-block; min-width:10px; text-align:center; background:#a4161a; color:#fff; border-radius:8px; padding:0 6px; font-size:11px; margin-left:6px; }
+  .badge.zero { background:#24304a; color:#8fa0ba; }
+  .hint { font-size:11px; color:#5c6b86; max-width:440px; line-height:1.5; }
   a { color:#9fd0ff; }
 </style>
 </head>
 <body>
-<h1>MORSE-CODE SIM</h1>
-<p class="sub">Same renderer as the panel (<code>uiFull / uiPattern / uiResult / uiProgress</code> on <code>170×320</code>). Hold BOOT like the real button.</p>
+<h1>MORSE-CODE SIM <span id="unreadTop"></span></h1>
+<p class="sub">Same renderer as the panel on <code>170×320</code>. Long-hold BOOT opens the action menu; incoming messages show a <code>N NEW</code> badge.</p>
 <div class="wrap">
   <div class="panel">
     <canvas id="lcd" width="170" height="320"></canvas>
@@ -39,7 +42,12 @@
     <div class="row">
       <button id="tap">tap = dot</button>
       <button id="dash">hold 300ms = dash</button>
+      <button id="holdmenu">hold 1.6s = menu</button>
       <button id="clear">clear</button>
+    </div>
+    <div class="row">
+      <input id="rxtext" type="text" value="HELLO ARE YOU OK" maxlength="96">
+      <button id="receive" class="recv">⇩ receive message</button>
     </div>
   </div>
   <div class="panel">
@@ -49,8 +57,10 @@
       <button id="settext">set text</button>
     </div>
     <div class="meta" id="state">…</div>
-    <p class="hint">Keys: <b>Space</b> = BOOT (hold for dash, 1.5s = clear), <b>C</b> = clear. Display polls <code>/api/frame.raw</code> at ~30fps and draws 1:1 pixels scaled with <code>pixelated</code>. Screenshot downloads the BMP the sim encodes from the same framebuffer the panel would blit.</p>
-    <p class="hint">Scenes match <code>make preview</code>: root, e-selected, hello, sos-help, mid-letter-s, wrapped, hold-dash, hold-clear.</p>
+    <div class="meta" id="inbox"></div>
+    <p class="hint">Keys: <b>Space</b> = BOOT (tap dot / hold dash / hold 1.5s menu), <b>C</b> = clear, <b>R</b> = receive. Display polls <code>/api/frame.raw</code> at ~30fps.</p>
+    <p class="hint"><b>COMPOSE:</b> type Morse. Long-hold opens the menu (<code>SEND</code> / <code>CLEAR</code> / <code>READ n</code> / <code>CLOSE</code>). Tap cycles, long-hold picks. <b>SEND</b> clears the buffer (simulates a send).<br><b>MESSAGE:</b> tap = read this message (it is gone) + show next. Long-hold opens <code>NEXT</code> / <code>CLOSE</code>: tap cycles, long-hold picks. A read message is removed and the <code>N NEW</code> badge counts what is left. Each message has a unique <code>#id</code>.</p>
+    <p class="hint">Scenes: root, e-selected, hello, sos-help, mid-letter-s, wrapped, hold-dash, hold-menu, menu, badge, message, message-menu.</p>
   </div>
 </div>
 <script>
@@ -75,7 +85,18 @@ async function state() {
     const r = await fetch('/api/state', {cache:'no-store'});
     const s = await r.json();
     document.getElementById('state').innerHTML =
-      'now      <b>'+s.now+'</b>\nnode     <b>'+s.node+' ('+s.nodeLetter+')</b>  depth <b>'+s.depth+'</b>\ntext     <b>'+escapeHtml(s.text)+'</b>\npressed  <b>'+s.pressed+'</b>';
+      'mode     <b>'+escapeHtml(s.mode||'?')+'</b>  unread <b>'+(s.unread||0)+'</b>  nextId <b>'+(s.nextId||1)+'</b>\nnode     <b>'+s.node+' ('+escapeHtml(s.nodeLetter||'')+')</b>  depth <b>'+s.depth+'</b>\ntext     <b>'+escapeHtml(s.text)+'</b>\npressed  <b>'+s.pressed+'</b>' +
+      (s.mode==='actions' ? '\nactions  <b>'+escapeHtml((s.actions||[]).join(' | '))+'</b> sel <b>'+s.actionSel+'</b>' : '') +
+      (s.mode==='message' ? '\nmsg      <b>#'+s.msgId+' '+(s.msgIdx+1)+'/'+s.unread+'</b> '+(s.msgMenu?'menu sel='+s.msgMenuSel:'tap=next hold=menu')+'\nmsgText  <b>'+escapeHtml(s.msgText||'')+'</b>' : '');
+    const ib = document.getElementById('inbox');
+    if (s.inbox && s.inbox.length) {
+      ib.innerHTML = 'inbox    ' + s.inbox.map(m => '<b>#'+m.id+'</b> '+escapeHtml(m.text)).join('\n         ');
+    } else {
+      ib.innerHTML = 'inbox    <b>(empty)</b>';
+    }
+    const top = document.getElementById('unreadTop');
+    if (s.unread > 0) top.innerHTML = '<span class="badge">'+s.unread+' NEW</span>';
+    else top.innerHTML = '<span class="badge zero">0 NEW</span>';
   } catch(e) {}
 }
 function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -94,6 +115,7 @@ boot.addEventListener('pointercancel', () => press(false));
 window.addEventListener('keydown', e => {
   if (e.code === 'Space' && !e.repeat) { e.preventDefault(); press(true); }
   if (e.key === 'c' || e.key === 'C') { fetch('/api/clear', {method:'POST'}); }
+  if (e.key === 'r' || e.key === 'R') { receive(); }
 });
 window.addEventListener('keyup', e => { if (e.code === 'Space') { e.preventDefault(); press(false); } });
 document.getElementById('tap').onclick = async () => {
@@ -104,7 +126,17 @@ document.getElementById('dash').onclick = async () => {
   await fetch('/api/press', {method:'POST', body:'down'});
   setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 320);
 };
+document.getElementById('holdmenu').onclick = async () => {
+  await fetch('/api/press', {method:'POST', body:'down'});
+  setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 1600);
+};
 document.getElementById('clear').onclick = () => fetch('/api/clear', {method:'POST'});
+async function receive() {
+  const t = document.getElementById('rxtext').value;
+  await fetch('/api/receive', {method:'POST', body: JSON.stringify({text:t})});
+  state();
+}
+document.getElementById('receive').onclick = receive;
 document.getElementById('shot').onclick = async () => {
   const r = await fetch('/api/frame.bmp', {cache:'no-store'});
   const b = await r.blob();
@@ -114,7 +146,7 @@ document.getElementById('shot').onclick = async () => {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
-const scenes = ['root','e-selected','hello','sos-help','mid-letter-s','wrapped','hold-dash','hold-clear'];
+const scenes = ['root','e-selected','hello','sos-help','mid-letter-s','wrapped','hold-dash','hold-menu','menu','badge','message','message-menu'];
 const box = document.getElementById('scenes');
 for (const s of scenes) {
   const btn = document.createElement('button');

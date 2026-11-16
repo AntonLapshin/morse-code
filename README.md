@@ -27,8 +27,11 @@ The board has two physical buttons: **BOOT** (GPIO0) and **RESET/EN**.
 | Hold **BOOT** (220 ms – 1.5 s) | dash (`−`) |
 | Pause 0.7 s after a symbol | commit the current letter |
 | Pause 4.0 s after a letter | insert a word space |
-| Hold **BOOT** ≥ 1.5 s | clear all decoded text |
+| Hold **BOOT** ≥ 1.5 s | open the action menu: `SEND` / `CLEAR` / `READ n` / `CLOSE` (tap cycles, hold picks; `SEND` clears the buffer, `READ n` opens the newest message) |
+| In a message: tap | read this message (it is removed) and show the next one |
+| In a message: hold ≥ 1.5 s | open the `NEXT` / `CLOSE` menu (tap cycles, hold picks; both remove the shown message) |
 | Press **RESET/EN** | clear all decoded text (the board reboots) |
+| Serial `MSG <text>` | simulate an incoming message (unique `#id`, `N NEW` badge top-right) |
 
 **About the RESET/EN button.** On the IdeaSpark board the button labelled
 `RESET` (the left-hand button) is wired to the ESP32 `EN` pin, not a normal
@@ -147,8 +150,9 @@ make preview
 # -> tools/preview/out/preview.png
 ```
 
-It renders eight scenes (idle, first dot, `HELLO`, `SOS HELP`, a mid-letter `S`,
-wrapped text, a held dash, and the armed clear gesture), scales them 2×, and
+It renders twelve scenes (idle, first dot, `HELLO`, `SOS HELP`, a mid-letter `S`,
+wrapped text, a held dash, the armed menu hold, the action sheet, the unread
+badge, a message card, and the message `NEXT`/`CLOSE` menu), scales them 2×, and
 montages them with ImageMagick. The preview uses the *real* tree table and
 renderer, so a coordinate fix there is a coordinate fix on the device.
 Requirements: a C++17 compiler and ImageMagick (`magick`).
@@ -168,11 +172,15 @@ make sim-dump            # headless screenshots -> tools/sim/out/*.ppm
 ```
 
 The web UI shows the live framebuffer on a `pixelated` canvas, a virtual BOOT
-button (pointer + `Space` key; tap = dot, hold = dash, 1.5 s = clear), the
-eight preview scenes, a text setter, and a BMP screenshot button. Endpoints:
-`GET /api/state`, `GET /api/frame.raw`, `GET /api/frame.bmp`,
-`POST /api/press` (`down`/`up`), `POST /api/scene`, `POST /api/text`,
-`POST /api/clear`.
+button (pointer + `Space` key; tap = dot, hold = dash, hold 1.5 s = action
+menu), a **receive message** button (`R`) that queues an incoming message with
+a unique `#id` and lights the `N NEW` badge, the twelve preview scenes, a text
+setter, and a BMP screenshot button. The inbox is newest-first; opening a
+message and moving on (`TAP`/ `NEXT`) or leaving it (`CLOSE`) removes it, so
+the badge always counts what is left. Endpoints: `GET /api/state`,
+`GET /api/frame.raw`, `GET /api/frame.bmp`, `POST /api/press` (`down`/`up`),
+`POST /api/scene`, `POST /api/text`, `POST /api/receive` (`{"text":"..."}`),
+`GET /api/messages`, `POST /api/clear`.
 
 ## Timing and configuration
 
@@ -232,7 +240,7 @@ letter 'I'  text="E I"
 | Board won't boot after a reset | BOOT may be held: release GPIO0 and press RESET again. |
 | Upload can't connect | Hold BOOT, tap RESET, release BOOT, then upload; most boards auto-reset correctly. |
 | Text clears when I press the RESET button | Expected: that button is RESET/EN. Use a `BTN_CLEAR_PIN` button for a software-only clear. |
-| Long dash clears everything | A hold ≥ 1.5 s is the clear gesture; shorten `CLEAR_HOLD_MS` or raise `DOT_MAX_MS` only if you really need slower dashes. |
+| Long dash clears everything | The old ≥ 1.5 s hold-to-clear is now the action menu (`SEND`/`CLEAR`/`READ`); pick `CLEAR` inside it. Shorten `CLEAR_HOLD_MS`/`ACTION_HOLD_MS` only if you really need slower dashes. |
 | Preview fails: `magick: unable to read font` | Install a fontconfig font (`fc-match sans`) or edit `scripts/preview.sh`; the script picks the font file automatically when available. |
 
 ## Repository layout

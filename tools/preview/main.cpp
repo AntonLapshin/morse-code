@@ -160,10 +160,53 @@ int main(int argc, char** argv) {
     render("hold-dash", st, now, PREVIEW_DASH, true);
   }
 
-  {  // Long hold: the clear gesture is armed.
+  {  // Long hold: the action menu is armed (replaces the old clear gesture).
     MorseState st = freshState(now);
     setText(st, "SOS HELP");
-    render("hold-clear", st, now, PREVIEW_CLEAR, true);
+    render("hold-menu", st, now, PREVIEW_ACTIONS, true);
+  }
+
+  {  // Unread badge: 3 new messages.
+    MorseState st = freshState(now);
+    setText(st, "HELLO");
+    st.lastCommitAt = now - 4000;
+    uiFull(st, now);
+    uiBadge(3, now);
+    char file[512];
+    snprintf(file, sizeof(file), "%s/%02d-%s.ppm", gOutDir.c_str(), gFrame++,
+             "badge");
+    writePPM(file);
+  }
+
+  {  // Action sheet: long-hold menu with SEND/CLEAR/READ/CLOSE.
+    MorseState st = freshState(now);
+    setText(st, "HELLO");
+    st.lastCommitAt = now - 4000;
+    uiFull(st, now);
+    uiBadge(2, now);
+    static const char* items[] = {"SEND", "CLEAR", "READ 2", "CLOSE"};
+    uiActionSheet(items, 4, 0, now);
+    char file[512];
+    snprintf(file, sizeof(file), "%s/%02d-%s.ppm", gOutDir.c_str(), gFrame++,
+             "menu");
+    writePPM(file);
+  }
+
+  {  // Incoming message card, wrapped body.
+    uiMessageCard(7, "HELLO ARE YOU OK MEET ME AT THE PARK AT SIX", 1, 2, false,
+                  0, now);
+    char file[512];
+    snprintf(file, sizeof(file), "%s/%02d-%s.ppm", gOutDir.c_str(), gFrame++,
+             "message");
+    writePPM(file);
+  }
+
+  {  // Message menu: NEXT/CLOSE on a long hold inside the reader.
+    uiMessageCard(8, "SECOND MESSAGE", 1, 2, true, 0, now);
+    char file[512];
+    snprintf(file, sizeof(file), "%s/%02d-%s.ppm", gOutDir.c_str(), gFrame++,
+             "message-menu");
+    writePPM(file);
   }
 
   printf("%d frames -> %s\n", gFrame, gOutDir.c_str());

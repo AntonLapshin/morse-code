@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <Adafruit_GFX.h>
@@ -68,6 +69,29 @@ static uint32_t inPressedAt  = 0;
 static uint8_t  preview      = PREVIEW_NONE;
 static uint32_t lastPreviewDraw  = 0;
 static uint32_t lastProgressDraw = 0;
+
+// --- app modes: COMPOSE Morse text, ACTIONS sheet, MESSAGE reader ------------
+enum AppMode : uint8_t { MODE_COMPOSE = 0, MODE_ACTIONS = 1, MODE_MESSAGE = 2 };
+static AppMode appMode = MODE_COMPOSE;
+
+// Inbox: newest first (index 0 = newest, shown as 1/N). Reading removes the
+// message, so stored count == unread count. `nextMsgId` gives each message a
+// unique id.
+static InboxMsg  inbox[INBOX_MAX];
+static uint8_t   inboxCount = 0;
+static uint32_t  nextMsgId  = 1;
+
+// ACTIONS sheet state.
+static char      actionBuf[5][16];
+static const char* actionPtrs[5];
+static uint8_t   actionCount = 0;
+static uint8_t   actionSel   = 0;
+
+// MESSAGE view state. `msgMenuOpen` selects between the card (tap = next)
+// and the small NEXT/CLOSE menu (tap cycles, hold picks).
+static uint8_t   msgIdx      = 0;
+static bool      msgMenuOpen = false;
+static uint8_t   msgMenuSel  = 0;
 
 static inline bool inputDownRaw() {
 #if BTN_ACTIVE_LOW
@@ -159,22 +183,220 @@ static void clearText(uint32_t now, const char* reason) {
   st.burstError      = true;
 
   uiFull(st, now);
+  uiBadge(inboxCount, now);
   Serial.printf("clear (%s)\n", reason);
 }
 
+// -----------------------------------------------------------------------------
+// Inbox + menus (long-hold opens menus; a read message is removed)
+// -----------------------------------------------------------------------------
+static void redrawCompose(uint32_t now) {
+  appMode = MODE_COMPOSE;
+  msgMenuOpen = false;
+  uiFull(st, now);
+  uiBadge(inboxCount, now);
+}
+
+static void rebuildActions() {
+  actionCount = 0;
+  if (st.len > 0) {
+    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "SEND");
+    actionPtrs[actionCount] = actionBuf[actionCount];
+    actionCount++;
+    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "CLEAR");
+    actionPtrs[actionCount] = actionBuf[actionCount];
+    actionCount++;
+  }
+  if (inboxCount > 0) {
+    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "READ %u",
+             (unsigned)inboxCount);
+    actionPtrs[actionCount] = actionBuf[actionCount];
+    actionCount++;
+  }
+  snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "CLOSE");
+  actionPtrs[actionCount] = actionBuf[actionCount];
+  actionCount++;
+  if (actionSel >= actionCount) actionSel = 0;
+}
+
+static void enterActions(uint32_t now) {
+  appMode = MODE_ACTIONS;
+  actionSel = 0;
+  rebuildActions();
+  uiFull(st, now);
+  uiBadge(inboxCount, now);
+  uiActionSheet(actionPtrs, actionCount, actionSel, now);
+  Serial.printf("menu actions (%u items)\n", (unsigned)actionCount);
+}
+
+static void redrawActions(uint32_t now) {
+  rebuildActions();
+  uiFull(st, now);
+  uiBadge(inboxCount, now);
+  uiActionSheet(actionPtrs, actionCount, actionSel, now);
+}
+
+static void enterMessage(uint32_t now, uint8_t idx) {
+  if (inboxCount == 0) {
+    redrawCompose(now);
+    return;
+  }
+  if (idx >= inboxCount) idx = 0;
+  appMode = MODE_MESSAGE;
+  msgIdx = idx;
+  msgMenuOpen = false;
+  msgMenuSel = 0;
+  uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
+                inboxCount, false, 0, now);
+  Serial.printf("open msg #%u (%u/%u)\n", (unsigned)inbox[msgIdx].id,
+                (unsigned)msgIdx + 1, (unsigned)inboxCount);
+}
+
+static void redrawMessage(uint32_t now) {
+  if (inboxCount == 0) {
+    redrawCompose(now);
+    return;
+  }
+  if (msgIdx >= inboxCount) msgIdx = 0;
+  uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
+                inboxCount, msgMenuOpen, msgMenuSel, now);
+}
+
+// Remove inbox[idx]; newest-first so deleting the viewed message reveals the
+// next older one at the same index.
+static void inboxRemoveAt(uint8_t idx) {
+  if (idx >= inboxCount) return;
+  Serial.printf("read msg #%u gone\n", (unsigned)inbox[idx].id);
+  for (uint8_t i = idx; i + 1 < inboxCount; i++) inbox[i] = inbox[i + 1];
+  inboxCount--;
+}
+
+// Newest-first insert; drops the oldest when full. Each message gets a unique
+// id from nextMsgId.
+static void inboxPush(const char* text, uint32_t now) {
+  if (!text || !*text) return;
+  InboxMsg m;
+  m.id = nextMsgId++;
+  size_t n = strlen(text);
+  if (n > MSG_TEXT_MAX) n = MSG_TEXT_MAX;
+  memcpy(m.text, text, n);
+  m.text[n] = '\0';
+  if (inboxCount >= INBOX_MAX) {
+    // Drop the oldest (last entry).
+    inboxCount = INBOX_MAX - 1;
+  }
+  for (uint8_t i = inboxCount; i > 0; i--) inbox[i] = inbox[i - 1];
+  inbox[0] = m;
+  inboxCount++;
+  Serial.printf("rx msg #%u len=%u unread=%u\n", (unsigned)m.id, (unsigned)n,
+                (unsigned)inboxCount);
+  if (appMode == MODE_COMPOSE) {
+    uiBadge(inboxCount, now);
+  } else if (appMode == MODE_ACTIONS) {
+    redrawActions(now);
+  } else {
+    redrawMessage(now);
+  }
+}
+
+// "NEXT" from the message view/menu: the viewed message counts as read, so it
+// is removed first, then the next older message is shown (or COMPOSE if none).
+static void messageNext(uint32_t now) {
+  inboxRemoveAt(msgIdx);
+  if (inboxCount == 0) {
+    redrawCompose(now);
+    return;
+  }
+  if (msgIdx >= inboxCount) msgIdx = 0;
+  msgMenuOpen = false;
+  msgMenuSel = 0;
+  redrawMessage(now);
+}
+
+// "CLOSE": the viewed message counts as read (removed), back to COMPOSE.
+static void messageClose(uint32_t now) {
+  inboxRemoveAt(msgIdx);
+  redrawCompose(now);
+}
+
+static void activateAction(uint32_t now) {
+  const char* sel = actionSel < actionCount ? actionPtrs[actionSel] : "CLOSE";
+  if (!strncmp(sel, "SEND", 4)) {
+    Serial.printf("send text=\"%s\"\n", st.text);
+    st.len = 0;
+    st.text[0] = '\0';
+    resetPath();
+    st.lastCommitAt = now;
+    st.lastSymbolAt = now;
+    redrawCompose(now);
+  } else if (!strncmp(sel, "CLEAR", 5)) {
+    st.len = 0;
+    st.text[0] = '\0';
+    resetPath();
+    st.lastCommitAt = now;
+    st.lastSymbolAt = now;
+    redrawCompose(now);
+    Serial.println("clear (menu)");
+  } else if (!strncmp(sel, "READ", 4)) {
+    enterMessage(now, 0);
+  } else {
+    redrawCompose(now);
+  }
+}
+
 static void onPressDown(uint32_t now) {
+  if (appMode != MODE_COMPOSE) return;
   // Starting a new symbol after a long pause: finish the previous letter
   // before the new symbol is accepted. This makes consecutive letters feel
   // immediate even if the commit timer has not fired yet.
   if (st.depth > 0 && now - st.lastSymbolAt >= LETTER_GAP_MS) {
     commitLetter(now);
     uiFull(st, now);
+    uiBadge(inboxCount, now);
   }
 }
 
 static void onRelease(uint32_t now, uint32_t durationMs) {
+  // Menus first: taps cycle, long holds pick.
+  if (appMode == MODE_ACTIONS) {
+    if (durationMs >= ACTION_HOLD_MS) {
+      activateAction(now);
+    } else {
+      if (actionCount > 0) actionSel = (uint8_t)((actionSel + 1) % actionCount);
+      uiActionSheet(actionPtrs, actionCount, actionSel, now);
+    }
+    return;
+  }
+  if (appMode == MODE_MESSAGE) {
+    if (!msgMenuOpen) {
+      if (durationMs >= ACTION_HOLD_MS) {
+        msgMenuOpen = true;
+        msgMenuSel = 0;
+        redrawMessage(now);
+      } else {
+        messageNext(now); // tap = read (gone) + show next
+      }
+    } else {
+      if (durationMs >= ACTION_HOLD_MS) {
+        if (msgMenuSel == 0)
+          messageNext(now);
+        else
+          messageClose(now);
+      } else {
+        msgMenuSel = (uint8_t)((msgMenuSel + 1) % 2);
+        redrawMessage(now);
+      }
+    }
+    return;
+  }
+
+  // COMPOSE: a long hold opens the action menu (SEND/CLEAR/READ...), never a
+  // direct clear. Commit any pending letter first so SEND includes it.
   if (durationMs >= CLEAR_HOLD_MS) {
-    clearText(now, "long hold");
+    if (st.depth > 0) {
+      commitLetter(now);
+    }
+    enterActions(now);
     return;
   }
 
@@ -188,17 +410,21 @@ static void onRelease(uint32_t now, uint32_t durationMs) {
 
   addSymbol(dash, now);
   uiFull(st, now);
+  uiBadge(inboxCount, now);
 }
 
 static void maybeCommit(uint32_t now) {
+  if (appMode != MODE_COMPOSE) return;
   if (st.depth == 0) return;
   if (inputDownRaw()) return; // still holding: this press extends the letter
   if (now - st.lastSymbolAt < LETTER_GAP_MS) return;
   commitLetter(now);
   uiFull(st, now);
+  uiBadge(inboxCount, now);
 }
 
 static void maybeWordSpace(uint32_t now) {
+  if (appMode != MODE_COMPOSE) return;
   if (st.depth != 0) return;
   if (st.len == 0) return;
   if (st.text[st.len - 1] == ' ') return;
@@ -227,8 +453,10 @@ static void pollInput(uint32_t now) {
       inPressedAt     = now;
       preview         = PREVIEW_DOT;
       onPressDown(now);
-      uiPattern(st, preview, now);
-      lastPreviewDraw = now;
+      if (appMode == MODE_COMPOSE) {
+        uiPattern(st, preview, now);
+        lastPreviewDraw = now;
+      }
     } else {
       uint32_t duration = now - inPressedAt;
       preview           = PREVIEW_NONE;
@@ -236,10 +464,10 @@ static void pollInput(uint32_t now) {
     }
   }
 
-  if (inPressed) {
+  if (inPressed && appMode == MODE_COMPOSE) {
     uint32_t held = now - inPressedAt;
     uint8_t  p;
-    if (held >= CLEAR_HOLD_MS)      p = PREVIEW_CLEAR;
+    if (held >= CLEAR_HOLD_MS)      p = PREVIEW_ACTIONS;
     else if (held >= DOT_MAX_MS)    p = PREVIEW_DASH;
     else                            p = PREVIEW_DOT;
 
@@ -312,6 +540,7 @@ void setup() {
   preview      = PREVIEW_NONE;
 
   uiFull(st, now);
+  uiBadge(0, now);
 
   Serial.println();
   Serial.println("morse-code v2");
@@ -321,11 +550,35 @@ void setup() {
                 BTN_CLEAR_PIN >= 0 ? "GPIO (optional)" : "RESET/EN button");
   Serial.printf("free heap: %u\n", (unsigned)ESP.getFreeHeap());
   Serial.println("tap = dot, hold = dash, pause = letter, long pause = space");
+  Serial.println("long hold = menu (SEND/CLEAR/READ), serial 'MSG <text>' = rx");
+}
+
+static void pollSerialRx(uint32_t now) {
+  // Dev hook (and the future net task entry point): typing
+  //   MSG HELLO WORLD
+  // into the serial monitor simulates an incoming message, like the sim's
+  // "receive" button. Each gets a unique id; the badge shows the count.
+  static char line[MSG_TEXT_MAX + 8];
+  static uint8_t n = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      line[n] = '\0';
+      n = 0;
+      if (!strncmp(line, "MSG ", 4) && line[4]) inboxPush(line + 4, now);
+      else if (!strcmp(line, "CLEAR")) clearText(now, "serial");
+      line[0] = '\0';
+    } else if (n + 1 < sizeof(line)) {
+      line[n++] = c;
+    }
+  }
 }
 
 void loop() {
   uint32_t now = millis();
 
+  pollSerialRx(now);
   maybeCommit(now);
   maybeWordSpace(now);
 
@@ -337,21 +590,23 @@ void loop() {
   now = millis();
 
   // Remove the transient "flash" ring.
-  if (st.burstActive && (int32_t)(now - st.burstUntil) >= 0) {
+  if (appMode == MODE_COMPOSE && st.burstActive &&
+      (int32_t)(now - st.burstUntil) >= 0) {
     st.burstActive = false;
     st.burstError  = false;
     uiFull(st, now);
+    uiBadge(inboxCount, now);
   }
 
   // Let the freshly appended character settle from green to white.
-  if (st.charFlashActive &&
+  if (appMode == MODE_COMPOSE && st.charFlashActive &&
       (int32_t)(now - (st.lastCharAt + RESULT_FLASH_MS)) >= 0) {
     st.charFlashActive = false;
     uiResult(st, now);
   }
 
   // Commit countdown bar (hidden while the button is held).
-  if (st.depth > 0 || inPressed) {
+  if (appMode == MODE_COMPOSE && (st.depth > 0 || inPressed)) {
     if (now - lastProgressDraw >= PROGRESS_REDRAW_MS) {
       lastProgressDraw = now;
       uiProgress(st, inPressed, now);

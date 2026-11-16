@@ -49,6 +49,22 @@ static uint8_t  previewState = PREVIEW_NONE;
 static uint32_t lastPreviewDraw = 0;
 static uint32_t lastProgressDraw = 0;
 
+// App modes mirror firmware/src/main.cpp: COMPOSE Morse text, ACTIONS sheet
+// (long-hold menu), MESSAGE reader. Inbox is newest-first; a read message is
+// removed so stored count == unread count. Each message gets a unique id.
+enum AppMode : uint8_t { MODE_COMPOSE = 0, MODE_ACTIONS = 1, MODE_MESSAGE = 2 };
+static AppMode appMode = MODE_COMPOSE;
+static InboxMsg inbox[INBOX_MAX];
+static uint8_t inboxCount = 0;
+static uint32_t nextMsgId = 1;
+static char actionBuf[5][16];
+static const char* actionPtrs[5];
+static uint8_t actionCount = 0;
+static uint8_t actionSel = 0;
+static uint8_t msgIdx = 0;
+static bool msgMenuOpen = false;
+static uint8_t msgMenuSel = 0;
+
 // Wall-clock boot time; virtual millis() like Arduino.
 static std::chrono::steady_clock::time_point bootTp;
 static uint32_t vnow() {
@@ -59,7 +75,7 @@ static uint32_t vnow() {
 
 static void appendChar(char c) {
   if (st.len >= TEXT_MAX) {
-    memmove(st.text, st.text + TEXT_MAX - 1, TEXT_MAX - 1);
+    memmove(st.text, st.text + 1, TEXT_MAX - 1);
     st.len = TEXT_MAX - 1;
   }
   st.text[st.len++] = c;
@@ -109,6 +125,142 @@ static void addSymbol(bool dash, uint32_t now) {
   st.burstError = false;
 }
 
+static void redrawCompose(uint32_t now) {
+  appMode = MODE_COMPOSE;
+  msgMenuOpen = false;
+  uiFull(st, now);
+  uiBadge(inboxCount, now);
+}
+
+static void rebuildActions() {
+  actionCount = 0;
+  if (st.len > 0) {
+    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "SEND");
+    actionPtrs[actionCount] = actionBuf[actionCount];
+    actionCount++;
+    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "CLEAR");
+    actionPtrs[actionCount] = actionBuf[actionCount];
+    actionCount++;
+  }
+  if (inboxCount > 0) {
+    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "READ %u",
+             (unsigned)inboxCount);
+    actionPtrs[actionCount] = actionBuf[actionCount];
+    actionCount++;
+  }
+  snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "CLOSE");
+  actionPtrs[actionCount] = actionBuf[actionCount];
+  actionCount++;
+  if (actionSel >= actionCount) actionSel = 0;
+}
+
+static void enterActions(uint32_t now) {
+  appMode = MODE_ACTIONS;
+  actionSel = 0;
+  rebuildActions();
+  uiFull(st, now);
+  uiBadge(inboxCount, now);
+  uiActionSheet(actionPtrs, actionCount, actionSel, now);
+}
+
+static void redrawActions(uint32_t now) {
+  rebuildActions();
+  uiFull(st, now);
+  uiBadge(inboxCount, now);
+  uiActionSheet(actionPtrs, actionCount, actionSel, now);
+}
+
+static void enterMessage(uint32_t now, uint8_t idx) {
+  if (inboxCount == 0) {
+    redrawCompose(now);
+    return;
+  }
+  if (idx >= inboxCount) idx = 0;
+  appMode = MODE_MESSAGE;
+  msgIdx = idx;
+  msgMenuOpen = false;
+  msgMenuSel = 0;
+  uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
+                inboxCount, false, 0, now);
+}
+
+static void redrawMessage(uint32_t now) {
+  if (inboxCount == 0) {
+    redrawCompose(now);
+    return;
+  }
+  if (msgIdx >= inboxCount) msgIdx = 0;
+  uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
+                inboxCount, msgMenuOpen, msgMenuSel, now);
+}
+
+static void inboxRemoveAt(uint8_t idx) {
+  if (idx >= inboxCount) return;
+  for (uint8_t i = idx; i + 1 < inboxCount; i++) inbox[i] = inbox[i + 1];
+  inboxCount--;
+}
+
+static void inboxPush(const char* text, uint32_t now) {
+  if (!text || !*text) return;
+  InboxMsg m;
+  m.id = nextMsgId++;
+  size_t n = strlen(text);
+  if (n > MSG_TEXT_MAX) n = MSG_TEXT_MAX;
+  memcpy(m.text, text, n);
+  m.text[n] = '\0';
+  if (inboxCount >= INBOX_MAX) inboxCount = INBOX_MAX - 1;
+  for (uint8_t i = inboxCount; i > 0; i--) inbox[i] = inbox[i - 1];
+  inbox[0] = m;
+  inboxCount++;
+  if (appMode == MODE_COMPOSE) {
+    uiBadge(inboxCount, now);
+  } else if (appMode == MODE_ACTIONS) {
+    redrawActions(now);
+  } else {
+    redrawMessage(now);
+  }
+}
+
+static void messageNext(uint32_t now) {
+  inboxRemoveAt(msgIdx);
+  if (inboxCount == 0) {
+    redrawCompose(now);
+    return;
+  }
+  if (msgIdx >= inboxCount) msgIdx = 0;
+  msgMenuOpen = false;
+  msgMenuSel = 0;
+  redrawMessage(now);
+}
+
+static void messageClose(uint32_t now) {
+  inboxRemoveAt(msgIdx);
+  redrawCompose(now);
+}
+
+static void activateAction(uint32_t now) {
+  const char* sel = actionSel < actionCount ? actionPtrs[actionSel] : "CLOSE";
+  if (!strncmp(sel, "SEND", 4)) {
+    st.len = 0;
+    st.text[0] = '\0';
+    resetPath();
+    st.lastCommitAt = now;
+    st.lastSymbolAt = now;
+    redrawCompose(now);
+  } else if (!strncmp(sel, "CLEAR", 5)) {
+    st.len = 0;
+    st.text[0] = '\0';
+    resetPath();
+    st.lastCommitAt = now;
+    st.lastSymbolAt = now;
+    redrawCompose(now);
+  } else if (!strncmp(sel, "READ", 4)) {
+    enterMessage(now, 0);
+  } else {
+    redrawCompose(now);
+  }
+}
+
 static void clearTextSim(uint32_t now) {
   st.len = 0;
   st.text[0] = '\0';
@@ -120,19 +272,53 @@ static void clearTextSim(uint32_t now) {
   st.burstUntil = now + BURST_MS;
   st.burstActive = true;
   st.burstError = true;
-  uiFull(st, now);
+  redrawCompose(now);
 }
 
 static void onPressDown(uint32_t now) {
+  if (appMode != MODE_COMPOSE) return;
   if (st.depth > 0 && now - st.lastSymbolAt >= LETTER_GAP_MS) {
     commitLetter(now);
     uiFull(st, now);
+    uiBadge(inboxCount, now);
   }
 }
 
 static void onRelease(uint32_t now, uint32_t durationMs) {
+  if (appMode == MODE_ACTIONS) {
+    if (durationMs >= ACTION_HOLD_MS) {
+      activateAction(now);
+    } else if (actionCount > 0) {
+      actionSel = (uint8_t)((actionSel + 1) % actionCount);
+      uiActionSheet(actionPtrs, actionCount, actionSel, now);
+    }
+    return;
+  }
+  if (appMode == MODE_MESSAGE) {
+    if (!msgMenuOpen) {
+      if (durationMs >= ACTION_HOLD_MS) {
+        msgMenuOpen = true;
+        msgMenuSel = 0;
+        redrawMessage(now);
+      } else {
+        messageNext(now);
+      }
+    } else {
+      if (durationMs >= ACTION_HOLD_MS) {
+        if (msgMenuSel == 0)
+          messageNext(now);
+        else
+          messageClose(now);
+      } else {
+        msgMenuSel = (uint8_t)((msgMenuSel + 1) % 2);
+        redrawMessage(now);
+      }
+    }
+    return;
+  }
   if (durationMs >= CLEAR_HOLD_MS) {
-    clearTextSim(now);
+    if (st.depth > 0) commitLetter(now);
+    enterActions(now);
     return;
   }
   bool dash = durationMs >= DOT_MAX_MS;
@@ -141,17 +327,21 @@ static void onRelease(uint32_t now, uint32_t durationMs) {
   }
   addSymbol(dash, now);
   uiFull(st, now);
+  uiBadge(inboxCount, now);
 }
 
 static void maybeCommit(uint32_t now, bool downRaw) {
+  if (appMode != MODE_COMPOSE) return;
   if (st.depth == 0) return;
   if (downRaw) return;
   if (now - st.lastSymbolAt < LETTER_GAP_MS) return;
   commitLetter(now);
   uiFull(st, now);
+  uiBadge(inboxCount, now);
 }
 
 static void maybeWordSpace(uint32_t now, bool downRaw) {
+  if (appMode != MODE_COMPOSE) return;
   if (st.depth != 0) return;
   if (st.len == 0) return;
   if (st.text[st.len - 1] == ' ') return;
@@ -177,19 +367,21 @@ static void pollInput(uint32_t now) {
       inPressedAt = now;
       previewState = PREVIEW_DOT;
       onPressDown(now);
-      uiPattern(st, previewState, now);
-      lastPreviewDraw = now;
+      if (appMode == MODE_COMPOSE) {
+        uiPattern(st, previewState, now);
+        lastPreviewDraw = now;
+      }
     } else {
       uint32_t duration = now - inPressedAt;
       previewState = PREVIEW_NONE;
       onRelease(now, duration);
     }
   }
-  if (inPressed) {
+  if (inPressed && appMode == MODE_COMPOSE) {
     uint32_t held = now - inPressedAt;
     uint8_t p;
     if (held >= CLEAR_HOLD_MS)
-      p = PREVIEW_CLEAR;
+      p = PREVIEW_ACTIONS;
     else if (held >= DOT_MAX_MS)
       p = PREVIEW_DASH;
     else
@@ -210,17 +402,19 @@ static void tick(uint32_t now) {
   maybeWordSpace(now, virtDown);
   pollInput(now);
   now = vnow();
-  if (st.burstActive && (int32_t)(now - st.burstUntil) >= 0) {
+  if (appMode == MODE_COMPOSE && st.burstActive &&
+      (int32_t)(now - st.burstUntil) >= 0) {
     st.burstActive = false;
     st.burstError = false;
     uiFull(st, now);
+    uiBadge(inboxCount, now);
   }
-  if (st.charFlashActive &&
+  if (appMode == MODE_COMPOSE && st.charFlashActive &&
       (int32_t)(now - (st.lastCharAt + RESULT_FLASH_MS)) >= 0) {
     st.charFlashActive = false;
     uiResult(st, now);
   }
-  if (st.depth > 0 || inPressed) {
+  if (appMode == MODE_COMPOSE && (st.depth > 0 || inPressed)) {
     if (now - lastProgressDraw >= PROGRESS_REDRAW_MS) {
       lastProgressDraw = now;
       uiProgress(st, inPressed, now);
@@ -243,7 +437,16 @@ static void resetSim(uint32_t now) {
   previewState = PREVIEW_NONE;
   lastPreviewDraw = 0;
   lastProgressDraw = 0;
+  appMode = MODE_COMPOSE;
+  inboxCount = 0;
+  nextMsgId = 1;
+  actionCount = 0;
+  actionSel = 0;
+  msgIdx = 0;
+  msgMenuOpen = false;
+  msgMenuSel = 0;
   uiFull(st, now);
+  uiBadge(0, now);
 }
 
 // -----------------------------------------------------------------------------
@@ -305,8 +508,48 @@ static void applyScene(const std::string& name) {
     uiFull(st, now);
     uiPattern(st, PREVIEW_CLEAR, now);
     return;
+  } else if (name == "hold-menu") {
+    setText(st, "SOS HELP");
+    uiFull(st, now);
+    uiBadge(2, now);
+    uiPattern(st, PREVIEW_ACTIONS, now);
+    return;
+  } else if (name == "menu") {
+    setText(st, "HELLO");
+    uiFull(st, now);
+    uiBadge(2, now);
+    inboxPush("ARE YOU OK", now);
+    inboxPush("MEET AT SIX", now);
+    // inboxPush paints badges; repaint compose then open the sheet
+    uiFull(st, now);
+    uiBadge(inboxCount, now);
+    appMode = MODE_ACTIONS;
+    actionSel = 0;
+    rebuildActions();
+    uiActionSheet(actionPtrs, actionCount, actionSel, now);
+    return;
+  } else if (name == "badge") {
+    setText(st, "HELLO");
+    uiFull(st, now);
+    uiBadge(3, now);
+    return;
+  } else if (name == "message") {
+    inboxPush("HELLO ARE YOU OK MEET ME AT THE PARK AT SIX", now);
+    uiMessageCard(inbox[0].id, inbox[0].text, 1, inboxCount, false, 0, now);
+    return;
+  } else if (name == "message-menu") {
+    inboxPush("FIRST MESSAGE", now);
+    inboxPush("SECOND MESSAGE", now);
+    appMode = MODE_MESSAGE;
+    msgIdx = 0;
+    msgMenuOpen = true;
+    msgMenuSel = 0;
+    uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text,
+                  (uint8_t)(msgIdx + 1), inboxCount, true, 0, now);
+    return;
   }
   uiFull(st, now);
+  uiBadge(inboxCount, now);
   if (name == "e-selected") uiProgress(st, false, now);
   if (name == "mid-letter-s") {
     // countdown visible
@@ -370,13 +613,10 @@ static std::vector<uint8_t> encodeBMP() {
   return bmp;
 }
 
-static std::string stateJSON() {
-  char buf[1024];
-  uint32_t now = vnow();
-  // JSON-escape text (letters, digits and space only in practice).
+static std::string jsonEscape(const char* s) {
   std::string esc;
-  for (uint8_t i = 0; i < st.len; i++) {
-    char c = st.text[i];
+  for (const char* p = s; *p; p++) {
+    char c = *p;
     if (c == '"' || c == '\\') {
       esc += '\\';
       esc += c;
@@ -388,13 +628,59 @@ static std::string stateJSON() {
       esc += tmp;
     }
   }
+  return esc;
+}
+
+static std::string stateJSON() {
+  uint32_t now = vnow();
+  std::string esc = jsonEscape(st.text);
   char letter = MORSE_NODES[st.node].letter ? MORSE_NODES[st.node].letter : '.';
+  const char* modeStr = appMode == MODE_COMPOSE ? "compose"
+                        : appMode == MODE_ACTIONS ? "actions"
+                                                  : "message";
+  char buf[2048];
   snprintf(buf, sizeof(buf),
            "{\"now\":%u,\"node\":%u,\"nodeLetter\":\"%c\",\"depth\":%u,"
-           "\"text\":\"%s\",\"pressed\":%s,\"preview\":%u}",
+           "\"text\":\"%s\",\"pressed\":%s,\"preview\":%u,"
+           "\"mode\":\"%s\",\"unread\":%u,\"nextId\":%u,"
+           "\"msgIdx\":%u,\"msgMenu\":%s,\"msgMenuSel\":%u,"
+           "\"actionSel\":%u}",
            now, st.node, letter, st.depth, esc.c_str(),
-           (virtDown || inPressed) ? "true" : "false", previewState);
-  return std::string(buf);
+           (virtDown || inPressed) ? "true" : "false", previewState, modeStr,
+           (unsigned)inboxCount, (unsigned)nextMsgId, (unsigned)msgIdx,
+           msgMenuOpen ? "true" : "false", (unsigned)msgMenuSel,
+           (unsigned)actionSel);
+  std::string out(buf);
+  // inbox: newest-first [{id,text}]
+  out.pop_back(); // remove }
+  out += ",\"inbox\":[";
+  for (uint8_t i = 0; i < inboxCount; i++) {
+    if (i) out += ",";
+    char ib[64];
+    snprintf(ib, sizeof(ib), "{\"id\":%u,\"text\":\"",
+             (unsigned)inbox[i].id);
+    out += ib;
+    out += jsonEscape(inbox[i].text);
+    out += "\"}";
+  }
+  out += "],\"actions\":[";
+  for (uint8_t i = 0; i < actionCount; i++) {
+    if (i) out += ",";
+    out += "\"";
+    out += jsonEscape(actionPtrs[i] ? actionPtrs[i] : "");
+    out += "\"";
+  }
+  out += "]";
+  if (appMode == MODE_MESSAGE && inboxCount > 0 && msgIdx < inboxCount) {
+    char mb[64];
+    snprintf(mb, sizeof(mb), ",\"msgId\":%u,", (unsigned)inbox[msgIdx].id);
+    out += mb;
+    out += "\"msgText\":\"";
+    out += jsonEscape(inbox[msgIdx].text);
+    out += "\"";
+  }
+  out += "}";
+  return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -546,6 +832,55 @@ static void handleClient(int fd) {
     resetSim(n2);
     setText(st, t.c_str());
     uiFull(st, n2);
+    uiBadge(inboxCount, n2);
+    payload = stateJSON();
+    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+           "Content-Length: " +
+           std::to_string(payload.size()) +
+           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
+           "*\r\n\r\n";
+  } else if (!strcmp(path, "/api/receive") && !strcmp(method, "POST")) {
+    // Simulate an incoming message. Body: {"text":"HELLO"} or plain text.
+    // Empty body cycles through sample texts. Each gets a unique id.
+    std::string t;
+    size_t q = body.find("\"text\"");
+    if (q != std::string::npos) {
+      size_t c = body.find(':', q);
+      size_t q1 = body.find('"', c);
+      size_t q2 = body.find('"', q1 + 1);
+      if (q1 != std::string::npos && q2 != std::string::npos)
+        t = body.substr(q1 + 1, q2 - q1 - 1);
+    } else if (!body.empty()) {
+      // plain text (trim whitespace/quotes)
+      std::string u;
+      for (char ch : body)
+        if (ch != '\r' && ch != '\n') u += ch;
+      size_t a = u.find_first_not_of(" \t\"'");
+      size_t b = u.find_last_not_of(" \t\"'");
+      if (a != std::string::npos && b != std::string::npos)
+        t = u.substr(a, b - a + 1);
+      else
+        t = "";
+      if (t == "{}" || t == "receive") t = "";
+    }
+    if (t.empty()) {
+      static const char* samples[] = {"HELLO", "ARE YOU OK",
+                                      "MEET AT SIX", "SOS",
+                                      "CALL ME BACK SOON", nullptr};
+      static int si = 0;
+      t = samples[si];
+      si = (si + 1) % 5;
+    }
+    // Cap to display length.
+    if (t.size() > MSG_TEXT_MAX) t.resize(MSG_TEXT_MAX);
+    inboxPush(t.c_str(), vnow());
+    payload = stateJSON();
+    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+           "Content-Length: " +
+           std::to_string(payload.size()) +
+           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
+           "*\r\n\r\n";
+  } else if (!strcmp(path, "/api/messages")) {
     payload = stateJSON();
     head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
            "Content-Length: " +
@@ -606,10 +941,14 @@ int main(int argc, char** argv) {
   if (!dumpDir.empty()) {
     const char* scenes[] = {"root",       "e-selected", "hello",
                             "sos-help",   "mid-letter-s", "wrapped",
-                            "hold-dash",  "hold-clear", nullptr};
+                            "hold-dash",  "hold-menu",  "menu",
+                            "badge",      "message",    "message-menu",
+                            nullptr};
     const char* fnames[] = {"00-root",       "01-e-selected", "02-hello",
                             "03-sos-help",   "04-mid-letter-s", "05-wrapped",
-                            "06-hold-dash",  "07-hold-clear", nullptr};
+                            "06-hold-dash",  "07-hold-menu",  "08-menu",
+                            "09-badge",      "10-message",    "11-message-menu",
+                            nullptr};
     for (int i = 0; scenes[i]; i++) {
       applyScene(scenes[i]);
       std::string p = dumpDir + "/" + fnames[i] + ".ppm";
