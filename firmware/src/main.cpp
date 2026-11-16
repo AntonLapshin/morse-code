@@ -70,6 +70,17 @@ static uint32_t inPressedAt  = 0;
 static uint8_t  preview      = PREVIEW_NONE;
 static uint32_t lastPreviewDraw  = 0;
 static uint32_t lastProgressDraw = 0;
+// Set once a long-hold action fires while still held, so the release is ignored.
+static bool     longFired    = false;
+
+// Undo window for "dash ignores the letter gap": the last committed letter is
+// kept so a dash arriving after LETTER_GAP_MS can extend it instead of starting
+// a new letter (dot + dash = A, not E + T). Cleared on space/clear/mode change.
+static uint8_t  undoNode      = 0;
+static uint8_t  undoDepth     = 0;
+static uint8_t  undoBits      = 0;
+static char     undoLetter    = 0;
+static bool     undoAvailable = false;
 
 // --- app modes: COMPOSE Morse text, ACTIONS sheet, MESSAGE reader ------------
 enum AppMode : uint8_t { MODE_COMPOSE = 0, MODE_ACTIONS = 1, MODE_MESSAGE = 2 };
@@ -128,6 +139,12 @@ static char commitLetter(uint32_t now) {
 
   char c = MORSE_NODES[st.node].letter;
   if (c != '\0') {
+    // Remember this letter so a later dash can un-commit and extend it.
+    undoNode      = st.node;
+    undoDepth     = st.depth;
+    undoBits      = st.bits;
+    undoLetter    = c;
+    undoAvailable = true;
     appendChar(c);
     st.lastCharAt      = now;
     st.charFlashActive = true;
@@ -175,6 +192,7 @@ static void clearText(uint32_t now, const char* reason) {
   st.len = 0;
   st.text[0] = '\0';
   resetPath();
+  undoAvailable = false;
   st.lastCommitAt    = now;
   st.lastSymbolAt    = now;
   st.charFlashActive = false;
@@ -223,6 +241,7 @@ static void rebuildActions() {
 static void enterActions(uint32_t now) {
   appMode = MODE_ACTIONS;
   actionSel = 0;
+  undoAvailable = false;
   rebuildActions();
   uiFull(st, now);
   uiBadge(inboxCount, now);
@@ -247,6 +266,7 @@ static void enterMessage(uint32_t now, uint8_t idx) {
   msgIdx = idx;
   msgMenuOpen = false;
   msgMenuSel = 0;
+  undoAvailable = false;
   uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
                 inboxCount, false, 0, now);
   Serial.printf("open msg #%u (%u/%u)\n", (unsigned)inbox[msgIdx].id,
@@ -348,6 +368,7 @@ static void messageClose(uint32_t now) {
 
 static void activateAction(uint32_t now) {
   const char* sel = actionSel < actionCount ? actionPtrs[actionSel] : "CLOSE";
+  undoAvailable = false;
   if (!strncmp(sel, "SEND", 4)) {
     // Phase 1: hand the text to the net outbox (like the sim's queueSend)
     // and clear the compose buffer immediately. The net task POSTs it and
@@ -392,18 +413,34 @@ static void activateAction(uint32_t now) {
 }
 
 static void onPressDown(uint32_t now) {
-  if (appMode != MODE_COMPOSE) return;
-  // Starting a new symbol after a long pause: finish the previous letter
-  // before the new symbol is accepted. This makes consecutive letters feel
-  // immediate even if the commit timer has not fired yet.
-  if (st.depth > 0 && now - st.lastSymbolAt >= LETTER_GAP_MS) {
-    commitLetter(now);
-    uiFull(st, now);
-    uiBadge(inboxCount, now);
-  }
+  (void)now;
+  // Intentionally empty: the commit-vs-extend decision is deferred to release.
+  // A short press (dot) after LETTER_GAP_MS starts a new letter, while a long
+  // press (dash) extends the pending letter even if the gap already expired
+  // (dot + dash = A). Committing here would break the dash-extends case.
+}
+
+static bool tryUncommitForDash() {
+  if (!undoAvailable || st.depth != 0) return false;
+  if (st.len == 0 || st.text[st.len - 1] != undoLetter) return false;
+  // Only un-commit when the dash can actually extend the letter. A leaf
+  // (e.g. H = ....) has no dash child, so keep it committed.
+  if (undoDepth == 0 || morseChild(undoNode, true) < 0) return false;
+  st.len--;
+  st.text[st.len] = '\0';
+  st.node  = undoNode;
+  st.depth = undoDepth;
+  st.bits  = undoBits;
+  undoAvailable = false;
+  return true;
 }
 
 static void onRelease(uint32_t now, uint32_t durationMs) {
+  // A long-hold action already fired while still held: ignore the release.
+  if (longFired) {
+    longFired = false;
+    return;
+  }
   // Menus first: taps cycle, long holds pick.
   if (appMode == MODE_ACTIONS) {
     if (durationMs >= ACTION_HOLD_MS) {
@@ -443,11 +480,21 @@ static void onRelease(uint32_t now, uint32_t durationMs) {
     if (st.depth > 0) {
       commitLetter(now);
     }
+    undoAvailable = false;
     enterActions(now);
     return;
   }
 
   bool dash = durationMs >= DOT_MAX_MS;
+
+  if (dash) {
+    // Long press ignores the letter gap: extend the pending letter instead of
+    // starting a new one (dot, pause, dash = A, not E + T).
+    tryUncommitForDash();
+  } else if (st.depth > 0 && now - st.lastSymbolAt >= LETTER_GAP_MS) {
+    // Short press after a pause: the previous letter is done.
+    commitLetter(now);
+  }
 
   // Leaf reached and another symbol arrives: finish the letter and start a
   // fresh one with this symbol. This allows continuous typing without waiting.
@@ -480,6 +527,7 @@ static void maybeWordSpace(uint32_t now) {
 
   appendChar(' ');
   st.lastCommitAt = now;
+  undoAvailable = false;
   uiResult(st, now);
   Serial.println("space");
 }
@@ -499,6 +547,7 @@ static void pollInput(uint32_t now) {
     if (inPressed) {
       inPressedAt     = now;
       preview         = PREVIEW_DOT;
+      longFired       = false;
       onPressDown(now);
       if (appMode == MODE_COMPOSE) {
         uiPattern(st, preview, now);
@@ -511,7 +560,31 @@ static void pollInput(uint32_t now) {
     }
   }
 
-  if (inPressed && appMode == MODE_COMPOSE) {
+  // Fire long-hold actions while still held so no release is needed.
+  if (inPressed && !longFired) {
+    uint32_t held = now - inPressedAt;
+    if (appMode == MODE_COMPOSE && held >= CLEAR_HOLD_MS) {
+      longFired = true;
+      if (st.depth > 0) commitLetter(now);
+      undoAvailable = false;
+      enterActions(now);
+    } else if (appMode == MODE_ACTIONS && held >= ACTION_HOLD_MS) {
+      longFired = true;
+      activateAction(now);
+    } else if (appMode == MODE_MESSAGE && held >= ACTION_HOLD_MS) {
+      longFired = true;
+      if (!msgMenuOpen) {
+        msgMenuOpen = true;
+        msgMenuSel = 0;
+        redrawMessage(now);
+      } else {
+        if (msgMenuSel == 0) messageNext(now);
+        else messageClose(now);
+      }
+    }
+  }
+
+  if (inPressed && !longFired && appMode == MODE_COMPOSE) {
     uint32_t held = now - inPressedAt;
     uint8_t  p;
     if (held >= CLEAR_HOLD_MS)      p = PREVIEW_ACTIONS;

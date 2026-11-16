@@ -75,6 +75,12 @@ struct DeviceSim {
   uint8_t previewState = PREVIEW_NONE;
   uint32_t lastPreviewDraw = 0;
   uint32_t lastProgressDraw = 0;
+  bool longFired = false;
+  uint8_t undoNode = 0;
+  uint8_t undoDepth = 0;
+  uint8_t undoBits = 0;
+  char undoLetter = 0;
+  bool undoAvailable = false;
 
   AppMode appMode = MODE_COMPOSE;
   InboxMsg inbox[INBOX_MAX];
@@ -656,6 +662,11 @@ static char commitLetter(DeviceSim& d, uint32_t now) {
   if (d.st.depth == 0) return 0;
   char c = MORSE_NODES[d.st.node].letter;
   if (c != '\0') {
+    d.undoNode = d.st.node;
+    d.undoDepth = d.st.depth;
+    d.undoBits = d.st.bits;
+    d.undoLetter = c;
+    d.undoAvailable = true;
     appendChar(d, c);
     d.st.lastCharAt = now;
     d.st.charFlashActive = true;
@@ -722,6 +733,7 @@ static void rebuildActions(DeviceSim& d) {
 static void enterActions(DeviceSim& d, uint32_t now) {
   d.appMode = MODE_ACTIONS;
   d.actionSel = 0;
+  d.undoAvailable = false;
   rebuildActions(d);
   selectDevice(d, deviceLink(d));
   uiFull(d.st, now);
@@ -739,6 +751,7 @@ static void enterMessage(DeviceSim& d, uint32_t now, uint8_t idx) {
   d.msgIdx = idx;
   d.msgMenuOpen = false;
   d.msgMenuSel = 0;
+  d.undoAvailable = false;
   selectDevice(d, deviceLink(d));
   uiMessageCard(d.inbox[d.msgIdx].id, d.inbox[d.msgIdx].text, (uint8_t)(d.msgIdx + 1),
                 d.inboxCount, false, 0, now);
@@ -817,6 +830,7 @@ static void queueSend(DeviceSim& d, const char* text) {
 
 static void activateAction(DeviceSim& d, uint32_t now) {
   const char* sel = d.actionSel < d.actionCount ? d.actionPtrs[d.actionSel] : "CLOSE";
+  d.undoAvailable = false;
   if (!strncmp(sel, "SEND", 4)) {
     queueSend(d, d.st.text);
     d.st.len = 0;
@@ -843,6 +857,7 @@ static void clearTextSim(DeviceSim& d, uint32_t now) {
   d.st.len = 0;
   d.st.text[0] = '\0';
   resetPath(d);
+  d.undoAvailable = false;
   d.st.lastCommitAt = now;
   d.st.lastSymbolAt = now;
   d.st.charFlashActive = false;
@@ -854,16 +869,30 @@ static void clearTextSim(DeviceSim& d, uint32_t now) {
 }
 
 static void onPressDown(DeviceSim& d, uint32_t now) {
-  if (d.appMode != MODE_COMPOSE) return;
-  if (d.st.depth > 0 && now - d.st.lastSymbolAt >= LETTER_GAP_MS) {
-    commitLetter(d, now);
-    selectDevice(d, deviceLink(d));
-    uiFull(d.st, now);
-    uiBadge(d.inboxCount, now);
-  }
+  (void)d;
+  (void)now;
+  // Intentionally empty: commit-vs-extend is decided on release so a dash can
+  // extend the letter even after LETTER_GAP_MS (dot + dash = A).
+}
+
+static bool tryUncommitForDash(DeviceSim& d) {
+  if (!d.undoAvailable || d.st.depth != 0) return false;
+  if (d.st.len == 0 || d.st.text[d.st.len - 1] != d.undoLetter) return false;
+  if (d.undoDepth == 0 || morseChild(d.undoNode, true) < 0) return false;
+  d.st.len--;
+  d.st.text[d.st.len] = '\0';
+  d.st.node = d.undoNode;
+  d.st.depth = d.undoDepth;
+  d.st.bits = d.undoBits;
+  d.undoAvailable = false;
+  return true;
 }
 
 static void onRelease(DeviceSim& d, uint32_t now, uint32_t durationMs) {
+  if (d.longFired) {
+    d.longFired = false;
+    return;
+  }
   if (d.appMode == MODE_ACTIONS) {
     if (durationMs >= ACTION_HOLD_MS) {
       activateAction(d, now);
@@ -898,10 +927,16 @@ static void onRelease(DeviceSim& d, uint32_t now, uint32_t durationMs) {
   }
   if (durationMs >= CLEAR_HOLD_MS) {
     if (d.st.depth > 0) commitLetter(d, now);
+    d.undoAvailable = false;
     enterActions(d, now);
     return;
   }
   bool dash = durationMs >= DOT_MAX_MS;
+  if (dash) {
+    tryUncommitForDash(d);
+  } else if (d.st.depth > 0 && now - d.st.lastSymbolAt >= LETTER_GAP_MS) {
+    commitLetter(d, now);
+  }
   if (d.st.depth > 0 && morseChild(d.st.node, dash) < 0) {
     commitLetter(d, now);
   }
@@ -931,6 +966,7 @@ static void maybeWordSpace(DeviceSim& d, uint32_t now, bool downRaw) {
   if (now - d.st.lastCommitAt < WORD_GAP_MS) return;
   appendChar(d, ' ');
   d.st.lastCommitAt = now;
+  d.undoAvailable = false;
   selectDevice(d, deviceLink(d));
   uiResult(d.st, now);
 }
@@ -946,6 +982,7 @@ static void pollInput(DeviceSim& d, uint32_t now) {
     if (d.inPressed) {
       d.inPressedAt = now;
       d.previewState = PREVIEW_DOT;
+      d.longFired = false;
       onPressDown(d, now);
       if (d.appMode == MODE_COMPOSE) {
         selectDevice(d, deviceLink(d));
@@ -958,7 +995,29 @@ static void pollInput(DeviceSim& d, uint32_t now) {
       onRelease(d, now, duration);
     }
   }
-  if (d.inPressed && d.appMode == MODE_COMPOSE) {
+  if (d.inPressed && !d.longFired) {
+    uint32_t held = now - d.inPressedAt;
+    if (d.appMode == MODE_COMPOSE && held >= CLEAR_HOLD_MS) {
+      d.longFired = true;
+      if (d.st.depth > 0) commitLetter(d, now);
+      d.undoAvailable = false;
+      enterActions(d, now);
+    } else if (d.appMode == MODE_ACTIONS && held >= ACTION_HOLD_MS) {
+      d.longFired = true;
+      activateAction(d, now);
+    } else if (d.appMode == MODE_MESSAGE && held >= ACTION_HOLD_MS) {
+      d.longFired = true;
+      if (!d.msgMenuOpen) {
+        d.msgMenuOpen = true;
+        d.msgMenuSel = 0;
+        redrawMessage(d, now);
+      } else {
+        if (d.msgMenuSel == 0) messageNext(d, now);
+        else messageClose(d, now);
+      }
+    }
+  }
+  if (d.inPressed && !d.longFired && d.appMode == MODE_COMPOSE) {
     uint32_t held = now - d.inPressedAt;
     uint8_t p;
     if (held >= CLEAR_HOLD_MS)
@@ -1054,6 +1113,12 @@ static void resetSim(DeviceSim& d, uint32_t now) {
   d.previewState = PREVIEW_NONE;
   d.lastPreviewDraw = 0;
   d.lastProgressDraw = 0;
+  d.longFired = false;
+  d.undoAvailable = false;
+  d.undoLetter = 0;
+  d.undoNode = 0;
+  d.undoDepth = 0;
+  d.undoBits = 0;
   d.appMode = MODE_COMPOSE;
   d.inboxCount = 0;
   d.nextMsgId = 1;
