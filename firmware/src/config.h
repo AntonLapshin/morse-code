@@ -40,13 +40,19 @@
 // --- Morse timing (milliseconds) ---------------------------------------------
 #define DEBOUNCE_MS       20   // button debounce
 #define DOT_MAX_MS        220  // release before this = DOT
-#define CLEAR_HOLD_MS     1500 // hold longer than this = clear the text
+#define CLEAR_HOLD_MS     1500 // hold longer than this = open the action menu
+#define ACTION_HOLD_MS    CLEAR_HOLD_MS // long-press opens/selects in menus
+#define NAV_TAP_MAX_MS    600  // tap vs. hold inside menus/message view
 #define LETTER_GAP_MS     700  // silence after a symbol -> commit the letter
 #define WORD_GAP_MS       4000 // silence after a letter -> insert a space
 #define BURST_MS          240  // node "flash" ring duration
 #define RESULT_FLASH_MS   350  // new character stays green in the result line
 #define PREVIEW_PULSE_MS  110  // held-symbol preview pulse period
 #define PROGRESS_REDRAW_MS 40  // commit-countdown bar refresh period
+
+// --- Messages ----------------------------------------------------------------
+#define INBOX_MAX         8    // max stored incoming messages (each gone on read)
+#define MSG_TEXT_MAX      96   // max chars per incoming message on the display
 
 // --- Result text -------------------------------------------------------------
 #define TEXT_MAX          96

@@ -1,5 +1,6 @@
 #include "ui.h"
 
+#include <cstdio>
 #include <new>
 #include <string.h>
 
@@ -32,6 +33,8 @@ static const uint16_t COL_RED_DARK   = C(30, 6, 6);
 static const uint16_t COL_YELLOW     = C(255, 214, 96);
 static const uint16_t COL_YELLOW_DIM = C(120, 94, 32);
 static const uint16_t COL_WHITE      = 0xFFFF;
+static const uint16_t COL_CARD       = C(14, 22, 40);
+static const uint16_t COL_CARD_EDGE  = C(60, 80, 110);
 
 // -----------------------------------------------------------------------------
 // Layout
@@ -209,6 +212,11 @@ static void drawPattern(const MorseState& st, uint8_t preview, uint32_t now) {
 
   if (preview == PREVIEW_CLEAR) {
     centeredText("CLEAR", PATTERN_TOP, 1, COL_RED, COL_BG);
+    return;
+  }
+
+  if (preview == PREVIEW_ACTIONS) {
+    centeredText("MENU", PATTERN_TOP, 1, COL_YELLOW, COL_BG);
     return;
   }
 
@@ -393,6 +401,66 @@ static void flushRect(int y, int h) {
 static void flushAll() { flushRect(0, SCREEN_H); }
 
 // -----------------------------------------------------------------------------
+// Inbox badge / menus / message card
+// -----------------------------------------------------------------------------
+static void drawSheetBox(int y0, int y1) {
+  gfx->fillRect(8, y0, SCREEN_W - 16, y1 - y0, COL_CARD);
+  gfx->drawRect(8, y0, SCREEN_W - 16, y1 - y0, COL_CARD_EDGE);
+}
+
+static void drawMenuItems(const char* const* items, uint8_t count,
+                          uint8_t selected, int yTop) {
+  gfx->setTextWrap(false);
+  for (uint8_t i = 0; i < count; i++) {
+    int y = yTop + (int)i * 18;
+    char line[24];
+    snprintf(line, sizeof(line), "%c %s", i == selected ? '>' : ' ',
+             items[i] ? items[i] : "");
+    if (i == selected) {
+      gfx->fillRect(12, y - 3, SCREEN_W - 24, 15, COL_GREEN_DARK);
+      drawText(line, 16, y, 1, COL_GREEN_IN, COL_GREEN_DARK);
+    } else {
+      drawText(line, 16, y, 1, COL_WHITE, COL_CARD);
+    }
+  }
+}
+
+// Word-wrap `text` into lines of at most `cols` chars. Returns line count.
+static uint8_t wrapText(const char* text, char lines[][26], uint8_t maxLines,
+                        uint8_t cols) {
+  uint8_t n = 0;
+  const char* p = text ? text : "";
+  while (*p && n < maxLines) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    const char* end = p;
+    const char* lastSpace = nullptr;
+    uint8_t len = 0;
+    while (*end && *end != '\n' && len < cols) {
+      if (*end == ' ') lastSpace = end;
+      end++;
+      len++;
+    }
+    const char* cut = end;
+    if (*end && *end != '\n' && lastSpace && lastSpace > p) cut = lastSpace;
+    size_t l = (size_t)(cut - p);
+    if (l > cols) l = cols;
+    if (l > 25) l = 25;
+    memcpy(lines[n], p, l);
+    lines[n][l] = '\0';
+    n++;
+    p = cut;
+    if (*p == ' ') p++;
+    if (*p == '\n') p++;
+    // Hard-break a word longer than one line.
+    if (*end && *end != ' ' && *end != '\n' && lastSpace == nullptr) {
+      // p already advanced by cols above
+    }
+  }
+  return n;
+}
+
+// -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
 void uiBegin(Adafruit_ST7789* display) {
@@ -434,4 +502,79 @@ void uiProgress(const MorseState& st, bool pressed, uint32_t now) {
   if (!gfx) return;
   drawProgress(st, pressed, now);
   flushRect(PROGRESS_Y, 3);
+}
+
+void uiBadge(uint8_t unread, uint32_t now) {
+  (void)now;
+  if (!gfx) return;
+  gfx->fillRect(0, 0, SCREEN_W, 14, COL_BG);
+  if (unread == 0) {
+    flushRect(0, 14);
+    return;
+  }
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%u NEW", unread);
+  int w = textAdvance(buf, 1, 0);
+  int x = SCREEN_W - w - 8;
+  gfx->fillCircle(x - 6, 6, 4, COL_RED);
+  drawText(buf, x, 3, 1, COL_WHITE, COL_BG);
+  flushRect(0, 14);
+}
+
+void uiActionSheet(const char* const* items, uint8_t count, uint8_t selected,
+                   uint32_t now) {
+  (void)now;
+  if (!gfx) return;
+  if (count == 0) return;
+  if (selected >= count) selected = 0;
+  const int y0 = 172, y1 = 312;
+  drawSheetBox(y0, y1);
+  centeredText("ACTIONS", y0 + 6, 1, COL_TITLE, COL_CARD);
+  gfx->fillRect(12, y0 + 18, SCREEN_W - 24, 1, COL_CARD_EDGE);
+  drawMenuItems(items, count, selected, y0 + 26);
+  centeredText("TAP NEXT HOLD PICK", y1 - 12, 1, COL_HINT, COL_CARD);
+  flushRect(y0, y1 - y0);
+}
+
+void uiMessageCard(uint32_t id, const char* text, uint8_t index1, uint8_t total,
+                   bool menuOpen, uint8_t menuSel, uint32_t now) {
+  (void)now;
+  if (!gfx) return;
+  gfx->fillScreen(COL_BG);
+  gfx->setTextWrap(false);
+
+  char left[20];
+  snprintf(left, sizeof(left), "MSG #%u", (unsigned)id);
+  drawText(left, 8, 6, 1, COL_TITLE, COL_BG);
+  char right[16];
+  if (total > 0)
+    snprintf(right, sizeof(right), "%u/%u", index1, total);
+  else
+    snprintf(right, sizeof(right), "0/0");
+  int rw = textAdvance(right, 1, 0);
+  drawText(right, SCREEN_W - rw - 8, 6, 1, COL_HINT, COL_BG);
+  gfx->fillRect(0, 20, SCREEN_W, 1, COL_DIVIDER);
+
+  char lines[10][26];
+  uint8_t n = wrapText(text, lines, 10, 25);
+  if (n == 0) {
+    drawText("(EMPTY)", 8, 34, 1, COL_HINT, COL_BG);
+  } else {
+    uint8_t show = n > 8 ? 8 : n;
+    for (uint8_t i = 0; i < show; i++)
+      drawText(lines[i], 8, 34 + (int)i * 13, 1, COL_WHITE, COL_BG);
+    if (n > 8) drawText("...", 8, 34 + 8 * 13, 1, COL_HINT, COL_BG);
+  }
+
+  if (menuOpen) {
+    const int y0 = 236, y1 = 312;
+    drawSheetBox(y0, y1);
+    static const char* mitems[2] = {"NEXT", "CLOSE"};
+    uint8_t sel = menuSel > 1 ? 0 : menuSel;
+    drawMenuItems(mitems, 2, sel, y0 + 10);
+    centeredText("TAP NEXT HOLD PICK", y1 - 12, 1, COL_HINT, COL_CARD);
+  } else {
+    centeredText("TAP NEXT HOLD MENU", 306, 1, COL_HINT, COL_BG);
+  }
+  flushAll();
 }

@@ -2,38 +2,44 @@
 
 // Index  Letter      x    y    lx   ly   parent dot dash shape
 // ---------------------------------------------------------------------------
-// Label convention (5x7 font, 5px ink): top row centred above (x-2, 40);
-// side labels vertically centred (y-4) with a 5px gap from the node edge
-// (dot: x+/-10/15, dash: x+/-12/17); below labels (y+9 dash / y+10 dot)
-// centred (x-2) except A/W which sit left-below to stay off the x=101 wire.
+// Grid layout: 8 columns x 7 rows, uniform 21px horizontal / 30px vertical.
+//   xs = 11, 32, 53, 74, 95, 116, 137, 158 (left rect edge = 5px padding)
+//   ys = 70, 100, 130, 160, 190, 220, 250 (top moved down 8px from title)
+// Every parent->child edge is axis-aligned: horizontal = 1 column (21px),
+// vertical = N rows (30px multiples). All node centres sit on grid lines.
+// Label convention (5x7 font, 5px ink): top row centred above (x-2, 48);
+// side labels vertically centred (y-4) with ~6px gap from the node edge
+// (dot: x+10 right / x-15 left, dash: x+12 right / x-17 left);
+// below labels centred (x-2, y+9 dot / y+9 dash, R uses y+10);
+// K/Y use above-centred (x-2, y-16) to stay off the y=160 wire.
 const MorseNode MORSE_NODES[] = {
-  { '\0',         87,  62,  -1,  -1,  -1,  1,  2, MORSE_ROOT }, // 0  start
-  { 'E',         101,  62,  99,  40,   0,  3,  4, MORSE_DOT  }, // 1  .
-  { 'T',          72,  62,  70,  40,   0,  5,  6, MORSE_DASH }, // 2  -
-  { 'I',         119,  62, 117,  40,   1,  7,  8, MORSE_DOT  }, // 3  ..
-  { 'A',         101, 160,  84, 169,   1,  9, 10, MORSE_DASH }, // 4  .-
-  { 'N',          72, 160,  82, 156,   2, 11, 12, MORSE_DOT  }, // 5  -.
-  { 'M',          46,  62,  44,  40,   2, 13, 14, MORSE_DASH }, // 6  --
-  { 'S',         137,  62, 135,  40,   3, 15, 16, MORSE_DOT  }, // 7  ...
-  { 'U',         119,  98, 102,  94,   3, 17, -1, MORSE_DASH }, // 8  ..-
-  { 'R',         121, 160, 119, 170,   4, 18, -1, MORSE_DOT  }, // 9  .-.
-  { 'W',         101, 215,  84, 224,   4, 19, 20, MORSE_DASH }, // 10 .--
-  { 'D',          72, 215,  82, 211,   5, 21, 22, MORSE_DOT  }, // 11 -..
-  { 'K',          44, 160,  42, 144,   5, 23, 24, MORSE_DASH }, // 12 -.-
-  { 'G',          46,  98,  56,  94,   6, 25, 26, MORSE_DOT  }, // 13 --.
-  { 'O',          22,  62,  20,  40,   6, -1, -1, MORSE_DASH }, // 14 ---
-  { 'H',         156,  62, 154,  40,   7, -1, -1, MORSE_DOT  }, // 15 ....
-  { 'V',         137,  98, 149,  94,   7, -1, -1, MORSE_DASH }, // 16 ...-
-  { 'F',         119, 126, 129, 122,   8, -1, -1, MORSE_DOT  }, // 17 ..-.
-  { 'L',         142, 160, 152, 156,   9, -1, -1, MORSE_DOT  }, // 18 .-..
-  { 'P',         119, 215, 129, 211,  10, -1, -1, MORSE_DOT  }, // 19 .--.
-  { 'J',         101, 249, 113, 245,  10, -1, -1, MORSE_DASH }, // 20 .---
-  { 'B',          72, 249,  57, 245,  11, -1, -1, MORSE_DOT  }, // 21 -...
-  { 'X',          41, 215,  24, 211,  11, -1, -1, MORSE_DASH }, // 22 -..-
-  { 'C',          46, 188,  56, 184,  12, -1, -1, MORSE_DOT  }, // 23 -.-.
-  { 'Y',          23, 160,  21, 144,  12, -1, -1, MORSE_DASH }, // 24 -.--
-  { 'Z',          46, 126,  56, 122,  13, -1, -1, MORSE_DOT  }, // 25 --..
-  { 'Q',          24,  98,  22, 107,  13, -1, -1, MORSE_DASH }, // 26 --.-
+  { '\0',         74,  70,  -1,  -1,  -1,  1,  2, MORSE_ROOT }, // 0  start
+  { 'E',          95,  70,  93,  48,   0,  3,  4, MORSE_DOT  }, // 1  .
+  { 'T',          53,  70,  51,  48,   0,  5,  6, MORSE_DASH }, // 2  -
+  { 'I',         116,  70, 114,  48,   1,  7,  8, MORSE_DOT  }, // 3  ..
+  { 'A',          95, 160,  78, 169,   1,  9, 10, MORSE_DASH }, // 4  .-
+  { 'N',          53, 160,  63, 156,   2, 11, 12, MORSE_DOT  }, // 5  -.
+  { 'M',          32,  70,  30,  48,   2, 13, 14, MORSE_DASH }, // 6  --
+  { 'S',         137,  70, 135,  48,   3, 15, 16, MORSE_DOT  }, // 7  ...
+  { 'U',         116, 100,  99,  96,   3, 17, -1, MORSE_DASH }, // 8  ..-
+  { 'R',         116, 160, 114, 170,   4, 18, -1, MORSE_DOT  }, // 9  .-.
+  { 'W',          95, 220,  78, 229,   4, 19, 20, MORSE_DASH }, // 10 .--
+  { 'D',          53, 220,  63, 216,   5, 21, 22, MORSE_DOT  }, // 11 -..
+  { 'K',          32, 160,  30, 144,   5, 23, 24, MORSE_DASH }, // 12 -.-
+  { 'G',          32, 100,  42,  96,   6, 25, 26, MORSE_DOT  }, // 13 --.
+  { 'O',          11,  70,   9,  48,   6, -1, -1, MORSE_DASH }, // 14 ---
+  { 'H',         158,  70, 156,  48,   7, -1, -1, MORSE_DOT  }, // 15 ....
+  { 'V',         137, 100, 149,  96,   7, -1, -1, MORSE_DASH }, // 16 ...-
+  { 'F',         116, 130, 126, 126,   8, -1, -1, MORSE_DOT  }, // 17 ..-.
+  { 'L',         137, 160, 147, 156,   9, -1, -1, MORSE_DOT  }, // 18 .-..
+  { 'P',         116, 220, 126, 216,  10, -1, -1, MORSE_DOT  }, // 19 .--.
+  { 'J',          95, 250, 107, 246,  10, -1, -1, MORSE_DASH }, // 20 .---
+  { 'B',          53, 250,  38, 246,  11, -1, -1, MORSE_DOT  }, // 21 -...
+  { 'X',          32, 220,  15, 216,  11, -1, -1, MORSE_DASH }, // 22 -..-
+  { 'C',          32, 190,  42, 186,  12, -1, -1, MORSE_DOT  }, // 23 -.-.
+  { 'Y',          11, 160,   9, 144,  12, -1, -1, MORSE_DASH }, // 24 -.--
+  { 'Z',          32, 130,  42, 126,  13, -1, -1, MORSE_DOT  }, // 25 --..
+  { 'Q',          11, 100,   9, 109,  13, -1, -1, MORSE_DASH }, // 26 --.-
 };
 
 const uint8_t MORSE_NODE_COUNT = sizeof(MORSE_NODES) / sizeof(MORSE_NODES[0]);
