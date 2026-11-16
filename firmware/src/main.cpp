@@ -472,7 +472,10 @@ static void onRelease(uint32_t now, uint32_t durationMs) {
 static void maybeCommit(uint32_t now) {
   if (appMode != MODE_COMPOSE) return;
   if (st.depth == 0) return;
-  if (inputDownRaw()) return; // still holding: this press extends the letter
+  // A press cycle in flight freezes the timer: raw level covers the hold,
+  // inPressed covers the debounce tail after physical release, so the gap
+  // cannot expire between letting go and the release being processed.
+  if (inputDownRaw() || inPressed) return;
   if (now - st.lastSymbolAt < LETTER_GAP_MS) return;
   commitLetter(now);
   uiFull(st, now);
@@ -484,7 +487,9 @@ static void maybeWordSpace(uint32_t now) {
   if (st.depth != 0) return;
   if (st.len == 0) return;
   if (st.text[st.len - 1] == ' ') return;
-  if (inputDownRaw()) return;
+  // Same press-cycle guard as maybeCommit: no space can slip in between
+  // physical release and the debounced release handling.
+  if (inputDownRaw() || inPressed) return;
   if (now - st.lastCommitAt < WORD_GAP_MS) return;
 
   appendChar(' ');

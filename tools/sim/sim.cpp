@@ -919,7 +919,9 @@ static void onRelease(DeviceSim& d, uint32_t now, uint32_t durationMs) {
 static void maybeCommit(DeviceSim& d, uint32_t now, bool downRaw) {
   if (d.appMode != MODE_COMPOSE) return;
   if (d.st.depth == 0) return;
-  if (downRaw) return;
+  // Press cycle in flight freezes the timer: raw level covers the hold,
+  // inPressed covers the debounce tail after release (mirrors firmware).
+  if (downRaw || d.inPressed) return;
   if (now - d.st.lastSymbolAt < LETTER_GAP_MS) return;
   commitLetter(d, now);
   selectDevice(d, deviceLink(d));
@@ -932,7 +934,7 @@ static void maybeWordSpace(DeviceSim& d, uint32_t now, bool downRaw) {
   if (d.st.depth != 0) return;
   if (d.st.len == 0) return;
   if (d.st.text[d.st.len - 1] == ' ') return;
-  if (downRaw) return;
+  if (downRaw || d.inPressed) return;
   if (now - d.st.lastCommitAt < WORD_GAP_MS) return;
   appendChar(d, ' ');
   d.st.lastCommitAt = now;
