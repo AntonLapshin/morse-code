@@ -9,10 +9,15 @@
 #   make preview             render the UI to tools/preview/out/preview.png
 #   make sim [PORT=8077]       run the ESP32 display simulator (web UI)
 #   make sim-dump              headless simulator screenshots to tools/sim/out
+#   make start                 start the relay server in the background
+#   make stop                  stop the relay server
+#   make restart               restart the relay server
 #   make clean               remove build + preview output
 
 PORT      ?= $(firstword $(wildcard /dev/ttyUSB* /dev/ttyACM*) $(UPLOAD_PORT) /dev/ttyUSB0)
 PORT_SIM  ?= 8077
+RELAY_HOST ?= 0.0.0.0
+RELAY_PORT ?= 8180
 DEVICE    ?= dad
 FQBN      := esp32:esp32:esp32
 SKETCH    := /tmp/morse-code-sketch/morse-code
@@ -22,7 +27,8 @@ BAUD      := 115200
 SOURCES := firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
            firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h
 
-.PHONY: help build upload monitor check preview sim sim-dump clean stage secrets
+.PHONY: help build upload monitor check preview sim sim-dump clean stage secrets \
+        start stop restart status
 
 help:
 	@echo "Targets:"
@@ -34,6 +40,9 @@ help:
 	@echo "  make preview                     render UI frames to a PNG (host-side)"
 	@echo "  make sim [PORT=8077]             ESP32 display simulator at http://localhost:8077/"
 	@echo "  make sim-dump                    headless simulator screenshots to tools/sim/out"
+	@echo "  make start [RELAY_PORT=8180]     start the relay server in the background"
+	@echo "  make stop                        stop the relay server"
+	@echo "  make restart                     restart the relay server"
 	@echo "  make clean                       remove build + preview output"
 	@echo ""
 	@echo "Current PORT: $(PORT)"
@@ -92,6 +101,10 @@ sim-dump:
 	  -o tools/sim/build/sim
 	./tools/sim/build/sim --dump tools/sim/out
 	@echo "Wrote tools/sim/out/00-*.ppm (170x320)"
+
+# Relay server: see server/Makefile for the implementation.
+start stop restart status:
+	@$(MAKE) --no-print-directory -C server $@ HOST=$(RELAY_HOST) PORT=$(RELAY_PORT)
 
 clean:
 	rm -rf /tmp/morse-code-sketch tools/preview/build tools/preview/out tools/sim/build tools/sim/out

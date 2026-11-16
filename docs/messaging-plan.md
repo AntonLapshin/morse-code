@@ -592,8 +592,12 @@ cd ~/ws/morse-code
 $EDITOR .env                # WiFi credentials + RELAY_HOST
 cd server
 uv sync
-uv run uvicorn app:app --host 0.0.0.0 --port 8180
+make start                  # or: uv run uvicorn app:app --host 0.0.0.0 --port 8180
 ```
+
+`make start` / `make stop` / `make restart` run the relay in the background and
+wait for `/health`; see [`server/Makefile`](server/Makefile). Logs live in
+`server/.run/`.
 
 The server reads the repo-root `.env` by absolute path, so the systemd unit
 below needs no `EnvironmentFile=`. Real environment variables override it.

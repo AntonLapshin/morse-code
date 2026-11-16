@@ -62,10 +62,12 @@ Phase 1 adds WiFi and an outbox.
 $EDITOR .env            # set WIFI_SSID + WIFI_PASS, check RELAY_HOST
 cd server
 uv sync
-uv run uvicorn app:app --host 0.0.0.0 --port 8180
+make start              # background uvicorn, waits for /health
 ```
 
-Run one worker only. Secrets live in `.env` (gitignored); see
+From the repo root: `make start`, `make stop`, `make restart` (add
+`RELAY_PORT=...` to bind elsewhere). Logs live in `server/.run/`. Run one
+worker only. Secrets live in `.env` (gitignored); see
 [`server/README.md`](server/README.md) for setup, the API, and the smoke test.
 
 Flashing a board copies its slice of `.env` into the firmware:

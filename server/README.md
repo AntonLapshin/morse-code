@@ -28,7 +28,24 @@ The firmware sends only its token; the server derives `from` from it.
 
 ## Run
 
-Bind to the LAN so the ESP32s can reach it. Do **not** port-forward.
+Bind to the LAN so the ESP32s can reach it. Do **not** port-forward. Start,
+stop, and restart it from `server/`:
+
+```bash
+cd server
+make start      # uvicorn on 0.0.0.0:8180; waits until /health answers
+make status     # pid, bind address, health
+make stop       # SIGTERM, then SIGKILL after 10 s
+make restart
+```
+
+From the repo root the same targets work (`make start`); pass
+`RELAY_PORT=...` there, or `PORT=...` in `server/`, to bind elsewhere. Logs and
+the pid file live in `server/.run/` (gitignored). `make start` also adopts a
+relay that was already started by hand and refuses to touch a port owned by
+another process.
+
+To run it in the foreground instead:
 
 ```bash
 cd server
@@ -108,6 +125,7 @@ config.toml            committed: server settings + device list, no secrets
 db.py                  schema, queries, retention
 auth.py                bearer token -> device
 models.py              request validation
+Makefile               make start/stop/restart/status (pid + log in .run/)
 tests/test_api.py      API tests (fake tokens, not real secrets)
 tests/test_config.py   .env loading + token validation
 scripts/smoke.sh       end-to-end curl acceptance (throwaway tokens)
