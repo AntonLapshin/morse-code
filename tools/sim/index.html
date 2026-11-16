@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>morse-code sim — ESP32 + ST7789</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#080c18; color:#d8e2f4; font-family:ui-monospace,Menlo,Consolas,monospace; margin:0; padding:16px; }
+  h1 { font-size:15px; margin:0 0 2px; color:#f6d368; letter-spacing:1px; }
+  p.sub { margin:0 0 12px; color:#74849c; font-size:12px; }
+  p.sub code { color:#9fb4d8; }
+  .wrap { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  .panel { background:#0c1222; border:1px solid #28344e; border-radius:10px; padding:12px; }
+  canvas#lcd { width:340px; height:640px; image-rendering:pixelated; background:#080c18; border:1px solid #28344e; border-radius:6px; touch-action:none; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+  button { background:#16203a; color:#d8e2f4; border:1px solid #33415e; border-radius:6px; padding:6px 10px; font:inherit; font-size:12px; cursor:pointer; }
+  button:hover { border-color:#7e94b4; }
+  button.active { border-color:#46eb37; color:#b2ffa0; }
+  button.boot { font-size:15px; padding:14px 18px; border-width:2px; user-select:none; -webkit-user-select:none; }
+  button.boot.held { background:#12330f; border-color:#46eb37; color:#b2ffa0; }
+  input[type=text] { background:#0a0f1e; color:#fff; border:1px solid #33415e; border-radius:6px; padding:6px 8px; font:inherit; font-size:12px; width:220px; }
+  .meta { font-size:12px; color:#9fb4d8; white-space:pre-wrap; }
+  .meta b { color:#fff; }
+  .hint { font-size:11px; color:#5c6b86; max-width:420px; line-height:1.5; }
+  a { color:#9fd0ff; }
+</style>
+</head>
+<body>
+<h1>MORSE-CODE SIM</h1>
+<p class="sub">Same renderer as the panel (<code>uiFull / uiPattern / uiResult / uiProgress</code> on <code>170×320</code>). Hold BOOT like the real button.</p>
+<div class="wrap">
+  <div class="panel">
+    <canvas id="lcd" width="170" height="320"></canvas>
+    <div class="row">
+      <button id="boot" class="boot">● BOOT (hold)</button>
+      <button id="shot">⇩ screenshot BMP</button>
+    </div>
+    <div class="row">
+      <button id="tap">tap = dot</button>
+      <button id="dash">hold 300ms = dash</button>
+      <button id="clear">clear</button>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="row" id="scenes"></div>
+    <div class="row">
+      <input id="text" type="text" value="SOS HELP" maxlength="96">
+      <button id="settext">set text</button>
+    </div>
+    <div class="meta" id="state">…</div>
+    <p class="hint">Keys: <b>Space</b> = BOOT (hold for dash, 1.5s = clear), <b>C</b> = clear. Display polls <code>/api/frame.raw</code> at ~30fps and draws 1:1 pixels scaled with <code>pixelated</code>. Screenshot downloads the BMP the sim encodes from the same framebuffer the panel would blit.</p>
+    <p class="hint">Scenes match <code>make preview</code>: root, e-selected, hello, sos-help, mid-letter-s, wrapped, hold-dash, hold-clear.</p>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('lcd');
+const ctx = cv.getContext('2d');
+const img = ctx.createImageData(170, 320);
+async function frame() {
+  try {
+    const r = await fetch('/api/frame.raw', {cache:'no-store'});
+    if (!r.ok) return;
+    const b = new Uint8Array(await r.arrayBuffer());
+    if (b.length < 170*320*3) return;
+    const d = img.data;
+    for (let i=0, j=0; i<b.length; i+=3, j+=4) {
+      d[j]=b[i]; d[j+1]=b[i+1]; d[j+2]=b[i+2]; d[j+3]=255;
+    }
+    ctx.putImageData(img, 0, 0);
+  } catch(e) {}
+}
+async function state() {
+  try {
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const s = await r.json();
+    document.getElementById('state').innerHTML =
+      'now      <b>'+s.now+'</b>\nnode     <b>'+s.node+' ('+s.nodeLetter+')</b>  depth <b>'+s.depth+'</b>\ntext     <b>'+escapeHtml(s.text)+'</b>\npressed  <b>'+s.pressed+'</b>';
+  } catch(e) {}
+}
+function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+setInterval(frame, 1000/30);
+setInterval(state, 300);
+frame(); state();
+
+async function press(down) {
+  await fetch('/api/press', {method:'POST', body: down ? 'down' : 'up'});
+  document.getElementById('boot').classList.toggle('held', !!down);
+}
+const boot = document.getElementById('boot');
+boot.addEventListener('pointerdown', e => { e.preventDefault(); boot.setPointerCapture(e.pointerId); press(true); });
+boot.addEventListener('pointerup', () => press(false));
+boot.addEventListener('pointercancel', () => press(false));
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !e.repeat) { e.preventDefault(); press(true); }
+  if (e.key === 'c' || e.key === 'C') { fetch('/api/clear', {method:'POST'}); }
+});
+window.addEventListener('keyup', e => { if (e.code === 'Space') { e.preventDefault(); press(false); } });
+document.getElementById('tap').onclick = async () => {
+  await fetch('/api/press', {method:'POST', body:'down'});
+  setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 90);
+};
+document.getElementById('dash').onclick = async () => {
+  await fetch('/api/press', {method:'POST', body:'down'});
+  setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 320);
+};
+document.getElementById('clear').onclick = () => fetch('/api/clear', {method:'POST'});
+document.getElementById('shot').onclick = async () => {
+  const r = await fetch('/api/frame.bmp', {cache:'no-store'});
+  const b = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b);
+  a.download = 'morse-sim.bmp';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+const scenes = ['root','e-selected','hello','sos-help','mid-letter-s','wrapped','hold-dash','hold-clear'];
+const box = document.getElementById('scenes');
+for (const s of scenes) {
+  const btn = document.createElement('button');
+  btn.textContent = s;
+  btn.onclick = () => fetch('/api/scene', {method:'POST', body: JSON.stringify({scene:s})});
+  box.appendChild(btn);
+}
+document.getElementById('settext').onclick = () => {
+  const t = document.getElementById('text').value;
+  fetch('/api/text', {method:'POST', body: JSON.stringify({text:t})});
+};
+</script>
+</body>
+</html>

@@ -153,6 +153,27 @@ montages them with ImageMagick. The preview uses the *real* tree table and
 renderer, so a coordinate fix there is a coordinate fix on the device.
 Requirements: a C++17 compiler and ImageMagick (`magick`).
 
+## Display simulator (live web UI)
+
+`tools/sim/` is an ESP32-device simulation with the display: it links the
+*real* `ui.cpp` + `morse.cpp` against host shims and serves a pixel-exact
+`170×320` panel in the browser, calling the same API the firmware uses
+(`uiBegin / uiFull / uiPattern / uiResult / uiProgress`) with the same input
+state machine as `main.cpp`.
+
+```bash
+make sim                 # http://localhost:8077/ (PORT_SIM=8080 to change)
+make sim-dump            # headless screenshots -> tools/sim/out/*.ppm
+./scripts/sim.sh 8077
+```
+
+The web UI shows the live framebuffer on a `pixelated` canvas, a virtual BOOT
+button (pointer + `Space` key; tap = dot, hold = dash, 1.5 s = clear), the
+eight preview scenes, a text setter, and a BMP screenshot button. Endpoints:
+`GET /api/state`, `GET /api/frame.raw`, `GET /api/frame.bmp`,
+`POST /api/press` (`down`/`up`), `POST /api/scene`, `POST /api/text`,
+`POST /api/clear`.
+
 ## Timing and configuration
 
 Everything tunable lives in [`firmware/src/config.h`](firmware/src/config.h):

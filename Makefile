@@ -7,9 +7,12 @@
 #   make check               verify toolchain + serial port
 #   make secrets DEVICE=dad  generate firmware/src/secrets.h from .env
 #   make preview             render the UI to tools/preview/out/preview.png
+#   make sim [PORT=8077]       run the ESP32 display simulator (web UI)
+#   make sim-dump              headless simulator screenshots to tools/sim/out
 #   make clean               remove build + preview output
 
 PORT      ?= $(firstword $(wildcard /dev/ttyUSB* /dev/ttyACM*) $(UPLOAD_PORT) /dev/ttyUSB0)
+PORT_SIM  ?= 8077
 DEVICE    ?= dad
 FQBN      := esp32:esp32:esp32
 SKETCH    := /tmp/morse-code-sketch/morse-code
@@ -19,7 +22,7 @@ BAUD      := 115200
 SOURCES := firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
            firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h
 
-.PHONY: help build upload monitor check preview clean stage secrets
+.PHONY: help build upload monitor check preview sim sim-dump clean stage secrets
 
 help:
 	@echo "Targets:"
@@ -29,6 +32,8 @@ help:
 	@echo "  make check                       verify arduino-cli core/libs + serial port"
 	@echo "  make secrets DEVICE=dad          generate firmware/src/secrets.h from .env"
 	@echo "  make preview                     render UI frames to a PNG (host-side)"
+	@echo "  make sim [PORT=8077]             ESP32 display simulator at http://localhost:8077/"
+	@echo "  make sim-dump                    headless simulator screenshots to tools/sim/out"
 	@echo "  make clean                       remove build + preview output"
 	@echo ""
 	@echo "Current PORT: $(PORT)"
@@ -77,5 +82,16 @@ monitor:
 preview:
 	./scripts/preview.sh
 
+sim:
+	./scripts/sim.sh $(PORT_SIM)
+
+sim-dump:
+	@mkdir -p tools/sim/build tools/sim/out
+	c++ -std=c++17 -O2 -Wall -Wextra -Itools/preview -Ifirmware/src \
+	  tools/sim/sim.cpp firmware/src/ui.cpp firmware/src/morse.cpp \
+	  -o tools/sim/build/sim
+	./tools/sim/build/sim --dump tools/sim/out
+	@echo "Wrote tools/sim/out/00-*.ppm (170x320)"
+
 clean:
-	rm -rf /tmp/morse-code-sketch tools/preview/build tools/preview/out
+	rm -rf /tmp/morse-code-sketch tools/preview/build tools/preview/out tools/sim/build tools/sim/out

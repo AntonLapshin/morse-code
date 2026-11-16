@@ -86,60 +86,61 @@ static void drawEdge(int x1, int y1, int x2, int y2, uint16_t c) {
   if (y1 == y2) {
     int xa = x1 < x2 ? x1 : x2;
     int xb = x1 < x2 ? x2 : x1;
-    gfx->fillRect(xa, y1 - 1, xb - xa + 1, 2, c);
+    gfx->fillRect(xa, y1, xb - xa + 1, 1, c);
   } else if (x1 == x2) {
     int ya = y1 < y2 ? y1 : y2;
     int yb = y1 < y2 ? y2 : y1;
-    gfx->fillRect(x1 - 1, ya, 2, yb - ya + 1, c);
+    gfx->fillRect(x1, ya, 1, yb - ya + 1, c);
   } else {
     gfx->drawLine(x1, y1, x2, y2, c);
   }
 }
 
 // Soft stepped halo, like the green glow on "E" in the reference image.
+// Kept tight (r9) so it never swallows the neighbouring nodes.
 static void drawGlow(int cx, int cy, bool error) {
   uint16_t dark = error ? COL_RED_DARK : COL_GREEN_DARK;
   uint16_t deep = error ? COL_RED_DEEP : COL_GREEN_DEEP;
   uint16_t mid  = error ? COL_RED_MID  : COL_GREEN_MID;
-  gfx->fillCircle(cx, cy, 12, dark);
-  gfx->fillCircle(cx, cy, 9, deep);
-  gfx->fillCircle(cx, cy, 7, mid);
+  gfx->fillCircle(cx, cy, 9, dark);
+  gfx->fillCircle(cx, cy, 7, deep);
+  gfx->fillCircle(cx, cy, 5, mid);
 }
 
 static void drawNodeShape(const MorseNode& n, bool current) {
   if (n.shape == MORSE_DOT) {
-    gfx->fillCircle(n.x, n.y, 6, COL_BG);
+    gfx->fillCircle(n.x, n.y, 4, COL_BG);
     if (current) {
-      gfx->fillCircle(n.x, n.y, 6, COL_GREEN);
-      gfx->drawCircle(n.x, n.y, 6, COL_GREEN_IN);
-      gfx->drawCircle(n.x, n.y, 5, COL_GREEN_IN);
-      gfx->fillCircle(n.x, n.y, 3, COL_GREEN_IN);
+      gfx->fillCircle(n.x, n.y, 4, COL_GREEN);
+      gfx->drawCircle(n.x, n.y, 4, COL_GREEN_IN);
+      gfx->drawCircle(n.x, n.y, 3, COL_GREEN_IN);
+      gfx->fillCircle(n.x, n.y, 2, COL_GREEN_IN);
       gfx->fillCircle(n.x, n.y, 1, COL_WHITE);
     } else {
-      gfx->drawCircle(n.x, n.y, 6, COL_LINE);
-      gfx->drawCircle(n.x, n.y, 5, COL_LINE);
+      gfx->drawCircle(n.x, n.y, 4, COL_LINE);
+      gfx->drawCircle(n.x, n.y, 3, COL_LINE);
     }
   } else if (n.shape == MORSE_DASH) {
-    int x = n.x - 8;
-    int y = n.y - 4;
-    gfx->fillRect(x, y, 16, 9, COL_BG);
+    int x = n.x - 6;
+    int y = n.y - 3;
+    gfx->fillRect(x, y, 12, 7, COL_BG);
     if (current) {
-      gfx->fillRect(x, y, 16, 9, COL_GREEN);
-      gfx->drawRect(x, y, 16, 9, COL_GREEN_IN);
-      gfx->drawRect(x + 1, y + 1, 14, 7, COL_GREEN_IN);
-      gfx->fillRect(x + 3, y + 2, 10, 5, COL_GREEN_IN);
+      gfx->fillRect(x, y, 12, 7, COL_GREEN);
+      gfx->drawRect(x, y, 12, 7, COL_GREEN_IN);
+      gfx->drawRect(x + 1, y + 1, 10, 5, COL_GREEN_IN);
+      gfx->fillRect(x + 3, y + 2, 6, 3, COL_GREEN_IN);
     } else {
-      gfx->drawRect(x, y, 16, 9, COL_LINE);
-      gfx->drawRect(x + 1, y + 1, 14, 7, COL_LINE);
+      gfx->drawRect(x, y, 12, 7, COL_LINE);
+      gfx->drawRect(x + 1, y + 1, 10, 5, COL_LINE);
     }
   } else { // root
-    gfx->fillCircle(n.x, n.y, 3, COL_BG);
+    gfx->fillCircle(n.x, n.y, 2, COL_BG);
     if (current) {
-      gfx->fillCircle(n.x, n.y, 3, COL_GREEN);
-      gfx->drawCircle(n.x, n.y, 4, COL_GREEN_IN);
+      gfx->fillCircle(n.x, n.y, 2, COL_GREEN);
+      gfx->drawCircle(n.x, n.y, 3, COL_GREEN_IN);
     } else {
-      gfx->drawCircle(n.x, n.y, 3, COL_LINE);
       gfx->drawCircle(n.x, n.y, 2, COL_LINE);
+      gfx->drawCircle(n.x, n.y, 1, COL_LINE);
     }
   }
 }
@@ -147,11 +148,11 @@ static void drawNodeShape(const MorseNode& n, bool current) {
 static void drawBurstRing(const MorseNode& n, bool error) {
   uint16_t c = error ? COL_RED : COL_GREEN_IN;
   if (n.shape == MORSE_DASH) {
-    gfx->drawRect(n.x - 12, n.y - 8, 24, 16, c);
-    gfx->drawRect(n.x - 13, n.y - 9, 26, 18, c);
+    gfx->drawRect(n.x - 9, n.y - 6, 18, 13, c);
+    gfx->drawRect(n.x - 10, n.y - 7, 20, 15, c);
   } else {
-    gfx->drawCircle(n.x, n.y, 10, c);
-    gfx->drawCircle(n.x, n.y, 11, c);
+    gfx->drawCircle(n.x, n.y, 7, c);
+    gfx->drawCircle(n.x, n.y, 8, c);
   }
 }
 
