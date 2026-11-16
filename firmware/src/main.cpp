@@ -539,6 +539,10 @@ void setup() {
   inPressed    = false;
   preview      = PREVIEW_NONE;
 
+  // No network task yet (Phase 1): red dot = no WiFi. The future net task
+  // will call uiSetLink(LINK_WIFI) once WiFi is up and uiSetLink(LINK_OK)
+  // once the relay answers, and uiBadge()/uiFull() will repaint the dot.
+  uiSetLink(LINK_OFF);
   uiFull(st, now);
   uiBadge(0, now);
 

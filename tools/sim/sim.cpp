@@ -1,32 +1,48 @@
-// morse-code UI simulator — ESP32 + ST7789 device simulation with display.
+// morse-code UI simulator — two ESP32 + ST7789 devices with live display.
 //
 // Links the REAL firmware renderer (firmware/src/ui.cpp + morse.cpp) against
 // the host Adafruit shims (tools/preview/) and exposes it through a tiny
-// stdlib-only HTTP server, so a browser shows exactly what the panel shows.
+// stdlib-only HTTP server, so a browser shows exactly what each panel shows.
 //
-// Same API as the device:
-//   uiBegin / uiFull / uiPattern / uiResult / uiProgress
-// are called here exactly as in firmware/src/main.cpp. The state machine
-// (commit, word-space, burst, flash, countdown) mirrors main.cpp with a
-// virtual BOOT button driven from the web UI.
+// Two virtual devices (dad + emma) run in this one process. Each has its own
+// input state machine (mirroring firmware/src/main.cpp), its own inbox, and
+// its own relay poller, so a SEND on one panel appears on the other panel via
+// the REAL relay server (default 192.168.4.44:8180, see --relay / .env).
+//
+// Link dot (top-left, see UiLink in ui.h):
+//   red    = no WiFi (toggle per device, or no relay configured)
+//   orange = WiFi OK, but no connection to the relay (down / bad token)
+//   green  = both WiFi and relay OK
 //
 // Usage:
-//   make sim              # build + serve on http://localhost:8077
+//   make sim                 # build + serve on http://localhost:8077
 //   ./tools/sim/build/sim --port 8077
 //   ./tools/sim/build/sim --dump tools/sim/out   # headless screenshots (PPM)
 //
-// No dependencies beyond a C++17 compiler and POSIX sockets.
+// The relay tokens come from the environment (MORSE_TOKEN_DAD /
+// MORSE_TOKEN_EMMA) or the repo-root .env, or --dad-token / --emma-token.
+// The browser UI can also reconfigure host/port/tokens at runtime via
+// POST /api/relay.
+//
+// No dependencies beyond a C++17 compiler, POSIX sockets, and pthreads.
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Adafruit_ST7789.h>
@@ -36,34 +52,1018 @@
 #include "ui.h"
 
 // -----------------------------------------------------------------------------
-// Virtual device state (mirrors firmware/src/main.cpp)
+// One virtual device (mirrors firmware/src/main.cpp per-device state)
 // -----------------------------------------------------------------------------
-static Adafruit_ST7789 display(15, 2, 4);
-static MorseState st;
-
-static bool     inRaw = false;
-static bool     inPressed = false;
-static uint32_t inRawChanged = 0;
-static uint32_t inPressedAt = 0;
-static uint8_t  previewState = PREVIEW_NONE;
-static uint32_t lastPreviewDraw = 0;
-static uint32_t lastProgressDraw = 0;
-
-// App modes mirror firmware/src/main.cpp: COMPOSE Morse text, ACTIONS sheet
-// (long-hold menu), MESSAGE reader. Inbox is newest-first; a read message is
-// removed so stored count == unread count. Each message gets a unique id.
 enum AppMode : uint8_t { MODE_COMPOSE = 0, MODE_ACTIONS = 1, MODE_MESSAGE = 2 };
-static AppMode appMode = MODE_COMPOSE;
-static InboxMsg inbox[INBOX_MAX];
-static uint8_t inboxCount = 0;
-static uint32_t nextMsgId = 1;
-static char actionBuf[5][16];
-static const char* actionPtrs[5];
-static uint8_t actionCount = 0;
-static uint8_t actionSel = 0;
-static uint8_t msgIdx = 0;
-static bool msgMenuOpen = false;
-static uint8_t msgMenuSel = 0;
+
+struct InboundItem {
+  long long seq = 0;
+  std::string from;
+  std::string text;
+};
+
+struct DeviceSim {
+  std::string id;
+  Adafruit_ST7789 display;
+
+  MorseState st;
+  bool inRaw = false;
+  bool inPressed = false;
+  bool virtDown = false;
+  uint32_t inRawChanged = 0;
+  uint32_t inPressedAt = 0;
+  uint8_t previewState = PREVIEW_NONE;
+  uint32_t lastPreviewDraw = 0;
+  uint32_t lastProgressDraw = 0;
+
+  AppMode appMode = MODE_COMPOSE;
+  InboxMsg inbox[INBOX_MAX];
+  uint8_t inboxCount = 0;
+  uint32_t nextMsgId = 1;
+  char actionBuf[5][16];
+  const char* actionPtrs[5];
+  uint8_t actionCount = 0;
+  uint8_t actionSel = 0;
+  uint8_t msgIdx = 0;
+  bool msgMenuOpen = false;
+  uint8_t msgMenuSel = 0;
+
+  // Relay sync, shared with the background poll thread. Everything below is
+  // guarded by mtx; the Morse/input state above is main-thread only.
+  std::mutex mtx;
+  std::string token;
+  long long lastSeq = 0;
+  long long ackedSeq = 0;
+  uint8_t link = LINK_OFF;
+  uint8_t linkCache = 0xFF; // main-thread copy to detect dot changes
+  std::string relayError = "starting";
+  std::string pendingSend;
+  uint64_t sendCounter = 0;
+  bool wifiOn = true;
+  std::vector<InboundItem> inbound;
+
+  DeviceSim(const char* devId) : id(devId), display(15, 2, 4) {
+    memset(&st, 0, sizeof(st));
+    memset(actionBuf, 0, sizeof(actionBuf));
+    memset(actionPtrs, 0, sizeof(actionPtrs));
+  }
+  DeviceSim(const DeviceSim&) = delete;
+  DeviceSim& operator=(const DeviceSim&) = delete;
+};
+
+static DeviceSim g_dad("dad");
+static DeviceSim g_emma("emma");
+
+static DeviceSim* devById(const std::string& id) {
+  if (id == "dad") return &g_dad;
+  if (id == "emma") return &g_emma;
+  return nullptr;
+}
+
+// Render target switch for the shared ui.cpp canvas (see uiAttach).
+static void selectDevice(DeviceSim& d, uint8_t link) {
+  uiAttach(&d.display);
+  uiSetLink(link);
+}
+
+static uint8_t deviceLink(DeviceSim& d) {
+  std::lock_guard<std::mutex> lk(d.mtx);
+  return d.wifiOn ? d.link : (uint8_t)LINK_OFF;
+}
+
+// -----------------------------------------------------------------------------
+// Relay configuration (host/port shared, tokens per device)
+// -----------------------------------------------------------------------------
+static std::string g_relayHost = "192.168.4.44";
+static int g_relayPort = 8180;
+static std::atomic<bool> g_relayEnabled{true};
+static std::atomic<bool> g_running{true};
+
+static std::string envOr(const char* key, const std::string& dflt) {
+  const char* v = getenv(key);
+  return (v && *v) ? std::string(v) : dflt;
+}
+
+static void loadDotEnvFile(const std::string& path,
+                           std::map<std::string, std::string>& out) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return;
+  char line[1024];
+  while (fgets(line, sizeof(line), f)) {
+    std::string s(line);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    size_t i = 0;
+    while (i < s.size() && isspace((unsigned char)s[i])) i++;
+    if (i >= s.size() || s[i] == '#') continue;
+    if (s.compare(i, 7, "export ") == 0) i += 7;
+    size_t eq = s.find('=', i);
+    if (eq == std::string::npos) continue;
+    std::string key = s.substr(i, eq - i);
+    while (!key.empty() && isspace((unsigned char)key.back())) key.pop_back();
+    std::string val = s.substr(eq + 1);
+    size_t a = 0;
+    while (a < val.size() && isspace((unsigned char)val[a])) a++;
+    size_t b = val.size();
+    while (b > a && isspace((unsigned char)val[b - 1])) b--;
+    val = val.substr(a, b > a ? b - a : 0);
+    if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
+      val = val.substr(1, val.size() - 2);
+    else if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'')
+      val = val.substr(1, val.size() - 2);
+    if (!key.empty()) out[key] = val;
+  }
+  fclose(f);
+}
+
+static void loadRelayConfigFromEnv() {
+  const char* explicitEnv = getenv("MORSE_ENV_FILE");
+  std::map<std::string, std::string> file;
+  if (explicitEnv && *explicitEnv) {
+    loadDotEnvFile(explicitEnv, file);
+  } else {
+    loadDotEnvFile(".env", file);
+    if (file.empty()) loadDotEnvFile("../.env", file);
+    if (file.empty()) loadDotEnvFile("../../.env", file);
+  }
+  auto pick = [&](const char* key, const std::string& dflt) {
+    std::string v = envOr(key, "");
+    if (!v.empty()) return v;
+    auto it = file.find(key);
+    if (it != file.end()) return it->second;
+    return dflt;
+  };
+  g_relayHost = pick("RELAY_HOST", g_relayHost);
+  std::string port = pick("RELAY_PORT", std::to_string(g_relayPort));
+  int p = atoi(port.c_str());
+  if (p >= 1 && p <= 65535) g_relayPort = p;
+  std::string dad = pick("MORSE_TOKEN_DAD", "");
+  std::string emma = pick("MORSE_TOKEN_EMMA", "");
+  if (!dad.empty()) {
+    std::lock_guard<std::mutex> lk(g_dad.mtx);
+    g_dad.token = dad;
+  }
+  if (!emma.empty()) {
+    std::lock_guard<std::mutex> lk(g_emma.mtx);
+    g_emma.token = emma;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Minimal HTTP client for the relay (background thread only)
+// -----------------------------------------------------------------------------
+static bool httpDo(const std::string& host, int port, const std::string& method,
+                   const std::string& path, const std::string& token,
+                   const std::string& body, int& status, std::string& respBody) {
+  status = 0;
+  respBody.clear();
+  char portStr[16];
+  snprintf(portStr, sizeof(portStr), "%d", port);
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* ai = nullptr;
+  if (getaddrinfo(host.c_str(), portStr, &hints, &ai) != 0 || !ai) return false;
+
+  int fd = -1;
+  for (addrinfo* p = ai; p; p = p->ai_next) {
+    fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd < 0) continue;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+    if (rc < 0 && errno != EINPROGRESS) {
+      close(fd);
+      fd = -1;
+      continue;
+    }
+    fd_set wf;
+    FD_ZERO(&wf);
+    FD_SET(fd, &wf);
+    timeval tv{3, 0};
+    rc = select(fd + 1, nullptr, &wf, nullptr, &tv);
+    if (rc <= 0) {
+      close(fd);
+      fd = -1;
+      continue;
+    }
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+    if (err != 0) {
+      close(fd);
+      fd = -1;
+      continue;
+    }
+    if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    break;
+  }
+  freeaddrinfo(ai);
+  if (fd < 0) return false;
+
+  timeval tv{4, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+  std::string req =
+      method + " " + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n";
+  if (!token.empty()) req += "Authorization: Bearer " + token + "\r\n";
+  if (!body.empty() || method == "POST")
+    req += "Content-Type: application/json\r\nContent-Length: " +
+           std::to_string(body.size()) + "\r\n";
+  req += "\r\n" + body;
+
+  size_t sent = 0;
+  while (sent < req.size()) {
+    ssize_t w = send(fd, req.data() + sent, req.size() - sent, 0);
+    if (w <= 0) {
+      close(fd);
+      return false;
+    }
+    sent += (size_t)w;
+  }
+  std::string resp;
+  char buf[4096];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) resp.append(buf, (size_t)n);
+  close(fd);
+  if (resp.empty()) return false;
+  int code = 0;
+  if (sscanf(resp.c_str(), "HTTP/%*d.%*d %d", &code) != 1) return false;
+  status = code;
+  size_t h = resp.find("\r\n\r\n");
+  respBody = (h == std::string::npos) ? "" : resp.substr(h + 4);
+  return true;
+}
+
+// -----------------------------------------------------------------------------
+// Tiny JSON readers (relay responses are small and ASCII)
+// -----------------------------------------------------------------------------
+static bool jsonUnescapeInto(const char* p, const char* end, std::string& out) {
+  out.clear();
+  while (p < end) {
+    char c = *p++;
+    if (c != '\\') {
+      out += c;
+      continue;
+    }
+    if (p >= end) return false;
+    char e = *p++;
+    switch (e) {
+      case '"': out += '"'; break;
+      case '\\': out += '\\'; break;
+      case '/': out += '/'; break;
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 't': out += '\t'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case 'u': {
+        if (end - p < 4) return false;
+        unsigned v = 0;
+        for (int i = 0; i < 4; i++) {
+          char h = *p++;
+          v <<= 4;
+          if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+          else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+          else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+          else return false;
+        }
+        if (v < 0x80) {
+          out += (char)v;
+        } else if (v < 0x800) {
+          out += (char)(0xC0 | (v >> 6));
+          out += (char)(0x80 | (v & 0x3F));
+        } else {
+          out += (char)(0xE0 | (v >> 12));
+          out += (char)(0x80 | ((v >> 6) & 0x3F));
+          out += (char)(0x80 | (v & 0x3F));
+        }
+        break;
+      }
+      default: return false;
+    }
+  }
+  return true;
+}
+
+// Find "key" : "string" (first occurrence at depth >= 0). Returns false if missing.
+static bool jsonStringVal(const std::string& body, const char* key, std::string& out) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t k = body.find(pat);
+  if (k == std::string::npos) return false;
+  size_t c = body.find(':', k + pat.size());
+  if (c == std::string::npos) return false;
+  size_t q1 = body.find('"', c + 1);
+  if (q1 == std::string::npos) return false;
+  // Walk to the closing unescaped quote.
+  size_t i = q1 + 1;
+  while (i < body.size()) {
+    if (body[i] == '\\') {
+      i += 2;
+      continue;
+    }
+    if (body[i] == '"') break;
+    i++;
+  }
+  if (i >= body.size()) return false;
+  return jsonUnescapeInto(body.data() + q1 + 1, body.data() + i, out);
+}
+
+static bool jsonIntVal(const std::string& body, const char* key, long long& out) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t k = body.find(pat);
+  if (k == std::string::npos) return false;
+  size_t c = body.find(':', k + pat.size());
+  if (c == std::string::npos) return false;
+  size_t i = c + 1;
+  while (i < body.size() && isspace((unsigned char)body[i])) i++;
+  bool neg = false;
+  if (i < body.size() && (body[i] == '-' || body[i] == '+')) {
+    neg = body[i] == '-';
+    i++;
+  }
+  if (i >= body.size() || !isdigit((unsigned char)body[i])) return false;
+  long long v = 0;
+  while (i < body.size() && isdigit((unsigned char)body[i])) {
+    v = v * 10 + (body[i] - '0');
+    i++;
+  }
+  out = neg ? -v : v;
+  return true;
+}
+
+static bool jsonBoolVal(const std::string& body, const char* key, bool& out) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t k = body.find(pat);
+  if (k == std::string::npos) return false;
+  size_t c = body.find(':', k + pat.size());
+  if (c == std::string::npos) return false;
+  size_t i = c + 1;
+  while (i < body.size() && isspace((unsigned char)body[i])) i++;
+  if (body.compare(i, 4, "true") == 0) {
+    out = true;
+    return true;
+  }
+  if (body.compare(i, 5, "false") == 0) {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+// Extract the messages[] array: every {"seq":N,...,"text":"..."} object.
+static std::vector<InboundItem> parseRelayMessages(const std::string& body) {
+  std::vector<InboundItem> items;
+  size_t arr = body.find("\"messages\"");
+  if (arr == std::string::npos) return items;
+  size_t b = body.find('[', arr);
+  if (b == std::string::npos) return items;
+  size_t i = b + 1;
+  while (i < body.size()) {
+    size_t o = body.find('{', i);
+    size_t close = body.find(']', b);
+    if (o == std::string::npos || (close != std::string::npos && o > close)) break;
+    // Find matching close brace (no nesting inside message objects).
+    size_t e = body.find('}', o);
+    if (e == std::string::npos) break;
+    std::string obj = body.substr(o, e - o + 1);
+    long long seq = 0;
+    // A message object without seq is not ours (e.g. an error body).
+    size_t ks = obj.find("\"seq\"");
+    if (ks != std::string::npos) {
+      size_t c = obj.find(':', ks);
+      if (c != std::string::npos) {
+        size_t k = c + 1;
+        while (k < obj.size() && isspace((unsigned char)obj[k])) k++;
+        while (k < obj.size() && isdigit((unsigned char)obj[k])) {
+          seq = seq * 10 + (obj[k] - '0');
+          k++;
+        }
+      }
+      if (seq > 0) {
+        InboundItem it;
+        it.seq = seq;
+        std::string from, text;
+        if (jsonStringVal(obj, "from", from)) it.from = from;
+        if (jsonStringVal(obj, "text", text)) {
+          it.text = text;
+          items.push_back(it);
+        }
+      }
+    }
+    i = e + 1;
+  }
+  return items;
+}
+
+static std::string jsonEscapeStr(const std::string& s) {
+  std::string out;
+  for (char c : s) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c >= 32 && c < 127) {
+      out += c;
+    } else {
+      char tmp[8];
+      snprintf(tmp, sizeof(tmp), "\\u%04x", (unsigned char)c);
+      out += tmp;
+    }
+  }
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// Relay poll thread: one cycle polls dad then emma (TX flush + RX poll + ack)
+// -----------------------------------------------------------------------------
+static void setLinkLocked(DeviceSim& d, uint8_t link, const std::string& err) {
+  d.link = link;
+  d.relayError = err;
+}
+
+static void relayCycleDevice(DeviceSim& d, const std::string& host, int port, bool enabled) {
+  std::string token;
+  long long since = 0;
+  std::string toSend;
+  uint64_t counter = 0;
+  bool wifiOn = true;
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    token = d.token;
+    since = d.lastSeq;
+    wifiOn = d.wifiOn;
+    if (!d.pendingSend.empty()) {
+      toSend = d.pendingSend;
+      counter = d.sendCounter;
+      d.pendingSend.clear();
+    }
+  }
+
+  if (!wifiOn) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_OFF, "wifi off (sim toggle)");
+    return;
+  }
+  if (!enabled) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "relay disabled in sim");
+    return;
+  }
+  if (host.empty()) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "no relay host configured");
+    return;
+  }
+  if (token.empty()) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "no token: set MORSE_TOKEN_" + d.id + " or use the relay bar");
+    return;
+  }
+
+  // Flush one queued outbound message first (Morse SEND or web send button).
+  if (!toSend.empty()) {
+    char cid[64];
+    snprintf(cid, sizeof(cid), "%s-sim-%llu", d.id.c_str(),
+             (unsigned long long)counter);
+    std::string payload = std::string("{\"client_msg_id\":\"") + cid +
+                          "\",\"to\":\"family\",\"text\":\"" + jsonEscapeStr(toSend) + "\"}";
+    int st = 0;
+    std::string resp;
+    if (!httpDo(host, port, "POST", "/api/v1/messages", token, payload, st, resp)) {
+      std::lock_guard<std::mutex> lk(d.mtx);
+      // Requeue once so a momentary drop does not eat the message.
+      if (d.pendingSend.empty()) {
+        d.pendingSend = toSend;
+      }
+      setLinkLocked(d, LINK_WIFI, "relay unreachable (send)");
+      return;
+    }
+    if (st == 401) {
+      std::lock_guard<std::mutex> lk(d.mtx);
+      setLinkLocked(d, LINK_WIFI, "auth rejected (401): token mismatch with relay .env?");
+      return;
+    }
+    if (st != 200 && st != 201) {
+      std::lock_guard<std::mutex> lk(d.mtx);
+      setLinkLocked(d, LINK_WIFI, "send rejected: HTTP " + std::to_string(st));
+      return;
+    }
+    long long seq = 0;
+    jsonIntVal(resp, "seq", seq);
+    if (seq > 0) {
+      std::lock_guard<std::mutex> lk(d.mtx);
+      if (seq > d.lastSeq) d.lastSeq = seq;
+    }
+  }
+
+  std::string path =
+      "/api/v1/messages?since=" + std::to_string(since) + "&wait=0&limit=20";
+  int st = 0;
+  std::string resp;
+  if (!httpDo(host, port, "GET", path, token, "", st, resp)) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    // Keep a previously-good green until proven otherwise? No: the dot must
+    // reflect reality, so a failed poll means orange (wifi ok, relay down).
+    setLinkLocked(d, LINK_WIFI, "relay unreachable: " + host + ":" + std::to_string(port));
+    return;
+  }
+  if (st == 401) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "auth rejected (401): token mismatch with relay .env?");
+    return;
+  }
+  if (st != 200) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "poll HTTP " + std::to_string(st));
+    return;
+  }
+
+  long long latest = since;
+  jsonIntVal(resp, "latest_seq", latest);
+  std::vector<InboundItem> msgs = parseRelayMessages(resp);
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    for (const auto& m : msgs) {
+      if (m.seq > d.lastSeq && !m.text.empty()) {
+        InboundItem it = m;
+        if (it.text.size() > MSG_TEXT_MAX) it.text.resize(MSG_TEXT_MAX);
+        d.inbound.push_back(it);
+      }
+    }
+    if (latest > d.lastSeq) d.lastSeq = latest;
+    // Backstop: if the server returned messages newer than latest_seq for
+    // any reason, still advance past them so they are not requeued.
+    for (const auto& m : msgs) {
+      if (m.seq > d.lastSeq) d.lastSeq = m.seq;
+    }
+    setLinkLocked(d, LINK_OK, "");
+  }
+
+  // Ack what we have so the relay's unread count tracks the sim.
+  long long upto = 0;
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    upto = d.lastSeq;
+    if (upto <= d.ackedSeq) return;
+  }
+  int ast = 0;
+  std::string aresp;
+  std::string apayload = "{\"upto_seq\":" + std::to_string(upto) + "}";
+  if (httpDo(host, port, "POST", "/api/v1/ack", token, apayload, ast, aresp) && ast == 200) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    if (upto > d.ackedSeq) d.ackedSeq = upto;
+  }
+}
+
+static void relayLoop() {
+  // Stagger so dad and emma do not poll in lockstep.
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  while (g_running) {
+    std::string host = g_relayHost;
+    int port = g_relayPort;
+    bool enabled = g_relayEnabled.load();
+    relayCycleDevice(g_dad, host, port, enabled);
+    if (!g_running) break;
+    relayCycleDevice(g_emma, host, port, enabled);
+    for (int i = 0; i < 20 && g_running; i++)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Virtual device state machine (mirrors firmware/src/main.cpp)
+// -----------------------------------------------------------------------------
+static uint32_t vnow();
+
+static void appendChar(DeviceSim& d, char c) {
+  if (d.st.len >= TEXT_MAX) {
+    memmove(d.st.text, d.st.text + 1, TEXT_MAX - 1);
+    d.st.len = TEXT_MAX - 1;
+  }
+  d.st.text[d.st.len++] = c;
+  d.st.text[d.st.len] = '\0';
+}
+
+static void resetPath(DeviceSim& d) {
+  d.st.node = MORSE_ROOT_INDEX;
+  d.st.depth = 0;
+  d.st.bits = 0;
+}
+
+static char commitLetter(DeviceSim& d, uint32_t now) {
+  if (d.st.depth == 0) return 0;
+  char c = MORSE_NODES[d.st.node].letter;
+  if (c != '\0') {
+    appendChar(d, c);
+    d.st.lastCharAt = now;
+    d.st.charFlashActive = true;
+  }
+  d.st.burstNode = d.st.node;
+  d.st.burstUntil = now + BURST_MS;
+  d.st.burstActive = true;
+  d.st.burstError = false;
+  resetPath(d);
+  d.st.lastCommitAt = now;
+  return c;
+}
+
+static void addSymbol(DeviceSim& d, bool dash, uint32_t now) {
+  int8_t child = morseChild(d.st.node, dash);
+  if (child < 0) {
+    commitLetter(d, now);
+    child = morseChild(MORSE_ROOT_INDEX, dash);
+  }
+  if (child < 0) return;
+  d.st.node = (uint8_t)child;
+  if (dash)
+    d.st.bits |= (uint8_t)(1u << d.st.depth);
+  else
+    d.st.bits &= (uint8_t)~(1u << d.st.depth);
+  d.st.depth++;
+  d.st.lastSymbolAt = now;
+  d.st.burstNode = d.st.node;
+  d.st.burstUntil = now + BURST_MS;
+  d.st.burstActive = true;
+  d.st.burstError = false;
+}
+
+static void redrawCompose(DeviceSim& d, uint32_t now) {
+  d.appMode = MODE_COMPOSE;
+  d.msgMenuOpen = false;
+  selectDevice(d, deviceLink(d));
+  uiFull(d.st, now);
+  uiBadge(d.inboxCount, now);
+}
+
+static void rebuildActions(DeviceSim& d) {
+  d.actionCount = 0;
+  if (d.st.len > 0) {
+    snprintf(d.actionBuf[d.actionCount], sizeof(d.actionBuf[0]), "SEND");
+    d.actionPtrs[d.actionCount] = d.actionBuf[d.actionCount];
+    d.actionCount++;
+    snprintf(d.actionBuf[d.actionCount], sizeof(d.actionBuf[0]), "CLEAR");
+    d.actionPtrs[d.actionCount] = d.actionBuf[d.actionCount];
+    d.actionCount++;
+  }
+  if (d.inboxCount > 0) {
+    snprintf(d.actionBuf[d.actionCount], sizeof(d.actionBuf[0]), "READ %u",
+             (unsigned)d.inboxCount);
+    d.actionPtrs[d.actionCount] = d.actionBuf[d.actionCount];
+    d.actionCount++;
+  }
+  snprintf(d.actionBuf[d.actionCount], sizeof(d.actionBuf[0]), "CLOSE");
+  d.actionPtrs[d.actionCount] = d.actionBuf[d.actionCount];
+  d.actionCount++;
+  if (d.actionSel >= d.actionCount) d.actionSel = 0;
+}
+
+static void enterActions(DeviceSim& d, uint32_t now) {
+  d.appMode = MODE_ACTIONS;
+  d.actionSel = 0;
+  rebuildActions(d);
+  selectDevice(d, deviceLink(d));
+  uiFull(d.st, now);
+  uiBadge(d.inboxCount, now);
+  uiActionSheet(d.actionPtrs, d.actionCount, d.actionSel, now);
+}
+
+static void enterMessage(DeviceSim& d, uint32_t now, uint8_t idx) {
+  if (d.inboxCount == 0) {
+    redrawCompose(d, now);
+    return;
+  }
+  if (idx >= d.inboxCount) idx = 0;
+  d.appMode = MODE_MESSAGE;
+  d.msgIdx = idx;
+  d.msgMenuOpen = false;
+  d.msgMenuSel = 0;
+  selectDevice(d, deviceLink(d));
+  uiMessageCard(d.inbox[d.msgIdx].id, d.inbox[d.msgIdx].text, (uint8_t)(d.msgIdx + 1),
+                d.inboxCount, false, 0, now);
+}
+
+static void redrawMessage(DeviceSim& d, uint32_t now) {
+  if (d.inboxCount == 0) {
+    redrawCompose(d, now);
+    return;
+  }
+  if (d.msgIdx >= d.inboxCount) d.msgIdx = 0;
+  selectDevice(d, deviceLink(d));
+  uiMessageCard(d.inbox[d.msgIdx].id, d.inbox[d.msgIdx].text, (uint8_t)(d.msgIdx + 1),
+                d.inboxCount, d.msgMenuOpen, d.msgMenuSel, now);
+}
+
+static void inboxRemoveAt(DeviceSim& d, uint8_t idx) {
+  if (idx >= d.inboxCount) return;
+  for (uint8_t i = idx; i + 1 < d.inboxCount; i++) d.inbox[i] = d.inbox[i + 1];
+  d.inboxCount--;
+}
+
+// Newest-first insert; drops the oldest when full.
+static void inboxPush(DeviceSim& d, const char* text, uint32_t now) {
+  if (!text || !*text) return;
+  InboxMsg m;
+  m.id = d.nextMsgId++;
+  size_t n = strlen(text);
+  if (n > MSG_TEXT_MAX) n = MSG_TEXT_MAX;
+  memcpy(m.text, text, n);
+  m.text[n] = '\0';
+  if (d.inboxCount >= INBOX_MAX) d.inboxCount = INBOX_MAX - 1;
+  for (uint8_t i = d.inboxCount; i > 0; i--) d.inbox[i] = d.inbox[i - 1];
+  d.inbox[0] = m;
+  d.inboxCount++;
+  selectDevice(d, deviceLink(d));
+  if (d.appMode == MODE_COMPOSE) {
+    uiBadge(d.inboxCount, now);
+  } else if (d.appMode == MODE_ACTIONS) {
+    rebuildActions(d);
+    uiFull(d.st, now);
+    uiBadge(d.inboxCount, now);
+    uiActionSheet(d.actionPtrs, d.actionCount, d.actionSel, now);
+  } else {
+    redrawMessage(d, now);
+  }
+}
+
+static void messageNext(DeviceSim& d, uint32_t now) {
+  inboxRemoveAt(d, d.msgIdx);
+  if (d.inboxCount == 0) {
+    redrawCompose(d, now);
+    return;
+  }
+  if (d.msgIdx >= d.inboxCount) d.msgIdx = 0;
+  d.msgMenuOpen = false;
+  d.msgMenuSel = 0;
+  redrawMessage(d, now);
+}
+
+static void messageClose(DeviceSim& d, uint32_t now) {
+  inboxRemoveAt(d, d.msgIdx);
+  redrawCompose(d, now);
+}
+
+// Queue outbound text for the relay poll thread (real POST). The compose
+// buffer clears immediately, exactly like the firmware's outbox handoff.
+static void queueSend(DeviceSim& d, const char* text) {
+  if (!text || !*text) return;
+  std::string t(text);
+  if (t.size() > MSG_TEXT_MAX) t.resize(MSG_TEXT_MAX);
+  std::lock_guard<std::mutex> lk(d.mtx);
+  d.pendingSend = t;
+  d.sendCounter++;
+}
+
+static void activateAction(DeviceSim& d, uint32_t now) {
+  const char* sel = d.actionSel < d.actionCount ? d.actionPtrs[d.actionSel] : "CLOSE";
+  if (!strncmp(sel, "SEND", 4)) {
+    queueSend(d, d.st.text);
+    d.st.len = 0;
+    d.st.text[0] = '\0';
+    resetPath(d);
+    d.st.lastCommitAt = now;
+    d.st.lastSymbolAt = now;
+    redrawCompose(d, now);
+  } else if (!strncmp(sel, "CLEAR", 5)) {
+    d.st.len = 0;
+    d.st.text[0] = '\0';
+    resetPath(d);
+    d.st.lastCommitAt = now;
+    d.st.lastSymbolAt = now;
+    redrawCompose(d, now);
+  } else if (!strncmp(sel, "READ", 4)) {
+    enterMessage(d, now, 0);
+  } else {
+    redrawCompose(d, now);
+  }
+}
+
+static void clearTextSim(DeviceSim& d, uint32_t now) {
+  d.st.len = 0;
+  d.st.text[0] = '\0';
+  resetPath(d);
+  d.st.lastCommitAt = now;
+  d.st.lastSymbolAt = now;
+  d.st.charFlashActive = false;
+  d.st.burstNode = MORSE_ROOT_INDEX;
+  d.st.burstUntil = now + BURST_MS;
+  d.st.burstActive = true;
+  d.st.burstError = true;
+  redrawCompose(d, now);
+}
+
+static void onPressDown(DeviceSim& d, uint32_t now) {
+  if (d.appMode != MODE_COMPOSE) return;
+  if (d.st.depth > 0 && now - d.st.lastSymbolAt >= LETTER_GAP_MS) {
+    commitLetter(d, now);
+    selectDevice(d, deviceLink(d));
+    uiFull(d.st, now);
+    uiBadge(d.inboxCount, now);
+  }
+}
+
+static void onRelease(DeviceSim& d, uint32_t now, uint32_t durationMs) {
+  if (d.appMode == MODE_ACTIONS) {
+    if (durationMs >= ACTION_HOLD_MS) {
+      activateAction(d, now);
+    } else if (d.actionCount > 0) {
+      d.actionSel = (uint8_t)((d.actionSel + 1) % d.actionCount);
+      selectDevice(d, deviceLink(d));
+      uiActionSheet(d.actionPtrs, d.actionCount, d.actionSel, now);
+    }
+    return;
+  }
+  if (d.appMode == MODE_MESSAGE) {
+    if (!d.msgMenuOpen) {
+      if (durationMs >= ACTION_HOLD_MS) {
+        d.msgMenuOpen = true;
+        d.msgMenuSel = 0;
+        redrawMessage(d, now);
+      } else {
+        messageNext(d, now);
+      }
+    } else {
+      if (durationMs >= ACTION_HOLD_MS) {
+        if (d.msgMenuSel == 0)
+          messageNext(d, now);
+        else
+          messageClose(d, now);
+      } else {
+        d.msgMenuSel = (uint8_t)((d.msgMenuSel + 1) % 2);
+        redrawMessage(d, now);
+      }
+    }
+    return;
+  }
+  if (durationMs >= CLEAR_HOLD_MS) {
+    if (d.st.depth > 0) commitLetter(d, now);
+    enterActions(d, now);
+    return;
+  }
+  bool dash = durationMs >= DOT_MAX_MS;
+  if (d.st.depth > 0 && morseChild(d.st.node, dash) < 0) {
+    commitLetter(d, now);
+  }
+  addSymbol(d, dash, now);
+  selectDevice(d, deviceLink(d));
+  uiFull(d.st, now);
+  uiBadge(d.inboxCount, now);
+}
+
+static void maybeCommit(DeviceSim& d, uint32_t now, bool downRaw) {
+  if (d.appMode != MODE_COMPOSE) return;
+  if (d.st.depth == 0) return;
+  if (downRaw) return;
+  if (now - d.st.lastSymbolAt < LETTER_GAP_MS) return;
+  commitLetter(d, now);
+  selectDevice(d, deviceLink(d));
+  uiFull(d.st, now);
+  uiBadge(d.inboxCount, now);
+}
+
+static void maybeWordSpace(DeviceSim& d, uint32_t now, bool downRaw) {
+  if (d.appMode != MODE_COMPOSE) return;
+  if (d.st.depth != 0) return;
+  if (d.st.len == 0) return;
+  if (d.st.text[d.st.len - 1] == ' ') return;
+  if (downRaw) return;
+  if (now - d.st.lastCommitAt < WORD_GAP_MS) return;
+  appendChar(d, ' ');
+  d.st.lastCommitAt = now;
+  selectDevice(d, deviceLink(d));
+  uiResult(d.st, now);
+}
+
+static void pollInput(DeviceSim& d, uint32_t now) {
+  bool raw = d.virtDown;
+  if (raw != d.inRaw) {
+    d.inRaw = raw;
+    d.inRawChanged = now;
+  }
+  if (now - d.inRawChanged >= DEBOUNCE_MS && raw != d.inPressed) {
+    d.inPressed = raw;
+    if (d.inPressed) {
+      d.inPressedAt = now;
+      d.previewState = PREVIEW_DOT;
+      onPressDown(d, now);
+      if (d.appMode == MODE_COMPOSE) {
+        selectDevice(d, deviceLink(d));
+        uiPattern(d.st, d.previewState, now);
+        d.lastPreviewDraw = now;
+      }
+    } else {
+      uint32_t duration = now - d.inPressedAt;
+      d.previewState = PREVIEW_NONE;
+      onRelease(d, now, duration);
+    }
+  }
+  if (d.inPressed && d.appMode == MODE_COMPOSE) {
+    uint32_t held = now - d.inPressedAt;
+    uint8_t p;
+    if (held >= CLEAR_HOLD_MS)
+      p = PREVIEW_ACTIONS;
+    else if (held >= DOT_MAX_MS)
+      p = PREVIEW_DASH;
+    else
+      p = PREVIEW_DOT;
+    if (p != d.previewState) {
+      d.previewState = p;
+      selectDevice(d, deviceLink(d));
+      uiPattern(d.st, d.previewState, now);
+      d.lastPreviewDraw = now;
+    } else if (now - d.lastPreviewDraw >= PREVIEW_PULSE_MS) {
+      selectDevice(d, deviceLink(d));
+      uiPattern(d.st, d.previewState, now);
+      d.lastPreviewDraw = now;
+    }
+  }
+}
+
+// Drain relay inbox into the on-screen inbox (main thread: owns all ui calls).
+static void drainInbound(DeviceSim& d, uint32_t now) {
+  std::vector<InboundItem> items;
+  uint8_t link;
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    items.swap(d.inbound);
+    link = d.wifiOn ? d.link : (uint8_t)LINK_OFF;
+  }
+  bool linkChanged = (link != d.linkCache);
+  d.linkCache = link;
+  if (!items.empty()) {
+    for (const auto& it : items) inboxPush(d, it.text.c_str(), now);
+  } else if (linkChanged) {
+    // Repaint just the top strip so the dot tracks the relay live.
+    selectDevice(d, link);
+    if (d.appMode == MODE_COMPOSE) {
+      uiBadge(d.inboxCount, now);
+    } else if (d.appMode == MODE_MESSAGE) {
+      redrawMessage(d, now);
+    } else {
+      rebuildActions(d);
+      uiFull(d.st, now);
+      uiBadge(d.inboxCount, now);
+      uiActionSheet(d.actionPtrs, d.actionCount, d.actionSel, now);
+    }
+  }
+}
+
+static void tickDevice(DeviceSim& d, uint32_t now) {
+  drainInbound(d, now);
+  maybeCommit(d, now, d.virtDown);
+  maybeWordSpace(d, now, d.virtDown);
+  pollInput(d, now);
+  now = vnow();
+  if (d.appMode == MODE_COMPOSE && d.st.burstActive &&
+      (int32_t)(now - d.st.burstUntil) >= 0) {
+    d.st.burstActive = false;
+    d.st.burstError = false;
+    selectDevice(d, deviceLink(d));
+    uiFull(d.st, now);
+    uiBadge(d.inboxCount, now);
+  }
+  if (d.appMode == MODE_COMPOSE && d.st.charFlashActive &&
+      (int32_t)(now - (d.st.lastCharAt + RESULT_FLASH_MS)) >= 0) {
+    d.st.charFlashActive = false;
+    selectDevice(d, deviceLink(d));
+    uiResult(d.st, now);
+  }
+  if (d.appMode == MODE_COMPOSE && (d.st.depth > 0 || d.inPressed)) {
+    if (now - d.lastProgressDraw >= PROGRESS_REDRAW_MS) {
+      d.lastProgressDraw = now;
+      selectDevice(d, deviceLink(d));
+      uiProgress(d.st, d.inPressed, now);
+    }
+  } else if (d.lastProgressDraw != 0) {
+    selectDevice(d, deviceLink(d));
+    uiProgress(d.st, false, now);
+    d.lastProgressDraw = 0;
+  }
+}
+
+static void resetSim(DeviceSim& d, uint32_t now) {
+  memset(&d.st, 0, sizeof(d.st));
+  d.st.node = MORSE_ROOT_INDEX;
+  d.st.text[0] = '\0';
+  d.st.lastCommitAt = now;
+  d.st.lastSymbolAt = now;
+  d.inRaw = d.virtDown;
+  d.inRawChanged = now;
+  d.inPressed = false;
+  d.previewState = PREVIEW_NONE;
+  d.lastPreviewDraw = 0;
+  d.lastProgressDraw = 0;
+  d.appMode = MODE_COMPOSE;
+  d.inboxCount = 0;
+  d.nextMsgId = 1;
+  d.actionCount = 0;
+  d.actionSel = 0;
+  d.msgIdx = 0;
+  d.msgMenuOpen = false;
+  d.msgMenuSel = 0;
+  redrawCompose(d, now);
+}
 
 // Wall-clock boot time; virtual millis() like Arduino.
 static std::chrono::steady_clock::time_point bootTp;
@@ -73,386 +1073,10 @@ static uint32_t vnow() {
       .count();
 }
 
-static void appendChar(char c) {
-  if (st.len >= TEXT_MAX) {
-    memmove(st.text, st.text + 1, TEXT_MAX - 1);
-    st.len = TEXT_MAX - 1;
-  }
-  st.text[st.len++] = c;
-  st.text[st.len] = '\0';
-}
-
-static void resetPath() {
-  st.node = MORSE_ROOT_INDEX;
-  st.depth = 0;
-  st.bits = 0;
-}
-
-static char commitLetter(uint32_t now) {
-  if (st.depth == 0) return 0;
-  char c = MORSE_NODES[st.node].letter;
-  if (c != '\0') {
-    appendChar(c);
-    st.lastCharAt = now;
-    st.charFlashActive = true;
-  }
-  st.burstNode = st.node;
-  st.burstUntil = now + BURST_MS;
-  st.burstActive = true;
-  st.burstError = false;
-  resetPath();
-  st.lastCommitAt = now;
-  return c;
-}
-
-static void addSymbol(bool dash, uint32_t now) {
-  int8_t child = morseChild(st.node, dash);
-  if (child < 0) {
-    commitLetter(now);
-    child = morseChild(MORSE_ROOT_INDEX, dash);
-  }
-  if (child < 0) return;
-  st.node = (uint8_t)child;
-  if (dash)
-    st.bits |= (uint8_t)(1u << st.depth);
-  else
-    st.bits &= (uint8_t)~(1u << st.depth);
-  st.depth++;
-  st.lastSymbolAt = now;
-  st.burstNode = st.node;
-  st.burstUntil = now + BURST_MS;
-  st.burstActive = true;
-  st.burstError = false;
-}
-
-static void redrawCompose(uint32_t now) {
-  appMode = MODE_COMPOSE;
-  msgMenuOpen = false;
-  uiFull(st, now);
-  uiBadge(inboxCount, now);
-}
-
-static void rebuildActions() {
-  actionCount = 0;
-  if (st.len > 0) {
-    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "SEND");
-    actionPtrs[actionCount] = actionBuf[actionCount];
-    actionCount++;
-    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "CLEAR");
-    actionPtrs[actionCount] = actionBuf[actionCount];
-    actionCount++;
-  }
-  if (inboxCount > 0) {
-    snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "READ %u",
-             (unsigned)inboxCount);
-    actionPtrs[actionCount] = actionBuf[actionCount];
-    actionCount++;
-  }
-  snprintf(actionBuf[actionCount], sizeof(actionBuf[0]), "CLOSE");
-  actionPtrs[actionCount] = actionBuf[actionCount];
-  actionCount++;
-  if (actionSel >= actionCount) actionSel = 0;
-}
-
-static void enterActions(uint32_t now) {
-  appMode = MODE_ACTIONS;
-  actionSel = 0;
-  rebuildActions();
-  uiFull(st, now);
-  uiBadge(inboxCount, now);
-  uiActionSheet(actionPtrs, actionCount, actionSel, now);
-}
-
-static void redrawActions(uint32_t now) {
-  rebuildActions();
-  uiFull(st, now);
-  uiBadge(inboxCount, now);
-  uiActionSheet(actionPtrs, actionCount, actionSel, now);
-}
-
-static void enterMessage(uint32_t now, uint8_t idx) {
-  if (inboxCount == 0) {
-    redrawCompose(now);
-    return;
-  }
-  if (idx >= inboxCount) idx = 0;
-  appMode = MODE_MESSAGE;
-  msgIdx = idx;
-  msgMenuOpen = false;
-  msgMenuSel = 0;
-  uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
-                inboxCount, false, 0, now);
-}
-
-static void redrawMessage(uint32_t now) {
-  if (inboxCount == 0) {
-    redrawCompose(now);
-    return;
-  }
-  if (msgIdx >= inboxCount) msgIdx = 0;
-  uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text, (uint8_t)(msgIdx + 1),
-                inboxCount, msgMenuOpen, msgMenuSel, now);
-}
-
-static void inboxRemoveAt(uint8_t idx) {
-  if (idx >= inboxCount) return;
-  for (uint8_t i = idx; i + 1 < inboxCount; i++) inbox[i] = inbox[i + 1];
-  inboxCount--;
-}
-
-static void inboxPush(const char* text, uint32_t now) {
-  if (!text || !*text) return;
-  InboxMsg m;
-  m.id = nextMsgId++;
-  size_t n = strlen(text);
-  if (n > MSG_TEXT_MAX) n = MSG_TEXT_MAX;
-  memcpy(m.text, text, n);
-  m.text[n] = '\0';
-  if (inboxCount >= INBOX_MAX) inboxCount = INBOX_MAX - 1;
-  for (uint8_t i = inboxCount; i > 0; i--) inbox[i] = inbox[i - 1];
-  inbox[0] = m;
-  inboxCount++;
-  if (appMode == MODE_COMPOSE) {
-    uiBadge(inboxCount, now);
-  } else if (appMode == MODE_ACTIONS) {
-    redrawActions(now);
-  } else {
-    redrawMessage(now);
-  }
-}
-
-static void messageNext(uint32_t now) {
-  inboxRemoveAt(msgIdx);
-  if (inboxCount == 0) {
-    redrawCompose(now);
-    return;
-  }
-  if (msgIdx >= inboxCount) msgIdx = 0;
-  msgMenuOpen = false;
-  msgMenuSel = 0;
-  redrawMessage(now);
-}
-
-static void messageClose(uint32_t now) {
-  inboxRemoveAt(msgIdx);
-  redrawCompose(now);
-}
-
-static void activateAction(uint32_t now) {
-  const char* sel = actionSel < actionCount ? actionPtrs[actionSel] : "CLOSE";
-  if (!strncmp(sel, "SEND", 4)) {
-    st.len = 0;
-    st.text[0] = '\0';
-    resetPath();
-    st.lastCommitAt = now;
-    st.lastSymbolAt = now;
-    redrawCompose(now);
-  } else if (!strncmp(sel, "CLEAR", 5)) {
-    st.len = 0;
-    st.text[0] = '\0';
-    resetPath();
-    st.lastCommitAt = now;
-    st.lastSymbolAt = now;
-    redrawCompose(now);
-  } else if (!strncmp(sel, "READ", 4)) {
-    enterMessage(now, 0);
-  } else {
-    redrawCompose(now);
-  }
-}
-
-static void clearTextSim(uint32_t now) {
-  st.len = 0;
-  st.text[0] = '\0';
-  resetPath();
-  st.lastCommitAt = now;
-  st.lastSymbolAt = now;
-  st.charFlashActive = false;
-  st.burstNode = MORSE_ROOT_INDEX;
-  st.burstUntil = now + BURST_MS;
-  st.burstActive = true;
-  st.burstError = true;
-  redrawCompose(now);
-}
-
-static void onPressDown(uint32_t now) {
-  if (appMode != MODE_COMPOSE) return;
-  if (st.depth > 0 && now - st.lastSymbolAt >= LETTER_GAP_MS) {
-    commitLetter(now);
-    uiFull(st, now);
-    uiBadge(inboxCount, now);
-  }
-}
-
-static void onRelease(uint32_t now, uint32_t durationMs) {
-  if (appMode == MODE_ACTIONS) {
-    if (durationMs >= ACTION_HOLD_MS) {
-      activateAction(now);
-    } else if (actionCount > 0) {
-      actionSel = (uint8_t)((actionSel + 1) % actionCount);
-      uiActionSheet(actionPtrs, actionCount, actionSel, now);
-    }
-    return;
-  }
-  if (appMode == MODE_MESSAGE) {
-    if (!msgMenuOpen) {
-      if (durationMs >= ACTION_HOLD_MS) {
-        msgMenuOpen = true;
-        msgMenuSel = 0;
-        redrawMessage(now);
-      } else {
-        messageNext(now);
-      }
-    } else {
-      if (durationMs >= ACTION_HOLD_MS) {
-        if (msgMenuSel == 0)
-          messageNext(now);
-        else
-          messageClose(now);
-      } else {
-        msgMenuSel = (uint8_t)((msgMenuSel + 1) % 2);
-        redrawMessage(now);
-      }
-    }
-    return;
-  }
-  if (durationMs >= CLEAR_HOLD_MS) {
-    if (st.depth > 0) commitLetter(now);
-    enterActions(now);
-    return;
-  }
-  bool dash = durationMs >= DOT_MAX_MS;
-  if (st.depth > 0 && morseChild(st.node, dash) < 0) {
-    commitLetter(now);
-  }
-  addSymbol(dash, now);
-  uiFull(st, now);
-  uiBadge(inboxCount, now);
-}
-
-static void maybeCommit(uint32_t now, bool downRaw) {
-  if (appMode != MODE_COMPOSE) return;
-  if (st.depth == 0) return;
-  if (downRaw) return;
-  if (now - st.lastSymbolAt < LETTER_GAP_MS) return;
-  commitLetter(now);
-  uiFull(st, now);
-  uiBadge(inboxCount, now);
-}
-
-static void maybeWordSpace(uint32_t now, bool downRaw) {
-  if (appMode != MODE_COMPOSE) return;
-  if (st.depth != 0) return;
-  if (st.len == 0) return;
-  if (st.text[st.len - 1] == ' ') return;
-  if (downRaw) return;
-  if (now - st.lastCommitAt < WORD_GAP_MS) return;
-  appendChar(' ');
-  st.lastCommitAt = now;
-  uiResult(st, now);
-}
-
-// Virtual BOOT level set by the web UI.
-static bool virtDown = false;
-
-static void pollInput(uint32_t now) {
-  bool raw = virtDown;
-  if (raw != inRaw) {
-    inRaw = raw;
-    inRawChanged = now;
-  }
-  if (now - inRawChanged >= DEBOUNCE_MS && raw != inPressed) {
-    inPressed = raw;
-    if (inPressed) {
-      inPressedAt = now;
-      previewState = PREVIEW_DOT;
-      onPressDown(now);
-      if (appMode == MODE_COMPOSE) {
-        uiPattern(st, previewState, now);
-        lastPreviewDraw = now;
-      }
-    } else {
-      uint32_t duration = now - inPressedAt;
-      previewState = PREVIEW_NONE;
-      onRelease(now, duration);
-    }
-  }
-  if (inPressed && appMode == MODE_COMPOSE) {
-    uint32_t held = now - inPressedAt;
-    uint8_t p;
-    if (held >= CLEAR_HOLD_MS)
-      p = PREVIEW_ACTIONS;
-    else if (held >= DOT_MAX_MS)
-      p = PREVIEW_DASH;
-    else
-      p = PREVIEW_DOT;
-    if (p != previewState) {
-      previewState = p;
-      uiPattern(st, previewState, now);
-      lastPreviewDraw = now;
-    } else if (now - lastPreviewDraw >= PREVIEW_PULSE_MS) {
-      uiPattern(st, previewState, now);
-      lastPreviewDraw = now;
-    }
-  }
-}
-
-static void tick(uint32_t now) {
-  maybeCommit(now, virtDown);
-  maybeWordSpace(now, virtDown);
-  pollInput(now);
-  now = vnow();
-  if (appMode == MODE_COMPOSE && st.burstActive &&
-      (int32_t)(now - st.burstUntil) >= 0) {
-    st.burstActive = false;
-    st.burstError = false;
-    uiFull(st, now);
-    uiBadge(inboxCount, now);
-  }
-  if (appMode == MODE_COMPOSE && st.charFlashActive &&
-      (int32_t)(now - (st.lastCharAt + RESULT_FLASH_MS)) >= 0) {
-    st.charFlashActive = false;
-    uiResult(st, now);
-  }
-  if (appMode == MODE_COMPOSE && (st.depth > 0 || inPressed)) {
-    if (now - lastProgressDraw >= PROGRESS_REDRAW_MS) {
-      lastProgressDraw = now;
-      uiProgress(st, inPressed, now);
-    }
-  } else if (lastProgressDraw != 0) {
-    uiProgress(st, false, now);
-    lastProgressDraw = 0;
-  }
-}
-
-static void resetSim(uint32_t now) {
-  memset(&st, 0, sizeof(st));
-  st.node = MORSE_ROOT_INDEX;
-  st.text[0] = '\0';
-  st.lastCommitAt = now;
-  st.lastSymbolAt = now;
-  inRaw = virtDown;
-  inRawChanged = now;
-  inPressed = false;
-  previewState = PREVIEW_NONE;
-  lastPreviewDraw = 0;
-  lastProgressDraw = 0;
-  appMode = MODE_COMPOSE;
-  inboxCount = 0;
-  nextMsgId = 1;
-  actionCount = 0;
-  actionSel = 0;
-  msgIdx = 0;
-  msgMenuOpen = false;
-  msgMenuSel = 0;
-  uiFull(st, now);
-  uiBadge(0, now);
-}
-
 // -----------------------------------------------------------------------------
 // Scenes (same set as tools/preview/main.cpp)
 // -----------------------------------------------------------------------------
-static void setText(MorseState& s, const char* t) {
+static void setTextState(MorseState& s, const char* t) {
   size_t n = strlen(t);
   if (n > TEXT_MAX) n = TEXT_MAX;
   memcpy(s.text, t, n);
@@ -460,107 +1084,118 @@ static void setText(MorseState& s, const char* t) {
   s.len = (uint8_t)n;
 }
 
-static void applyScene(const std::string& name) {
+static void applyScene(DeviceSim& d, const std::string& name) {
   uint32_t now = vnow();
-  resetSim(now);
-  virtDown = false;
+  resetSim(d, now);
+  d.virtDown = false;
+  // Demo every link color across the dump: idle is offline (red), the armed
+  // hold is wifi-without-relay (orange), everything else is online (green).
+  uint8_t link = LINK_OK;
+  if (name == "root") link = LINK_OFF;
+  if (name == "hold-menu") link = LINK_WIFI;
+  selectDevice(d, link);
   if (name == "root") {
     // idle
   } else if (name == "e-selected") {
-    st.node = 1;
-    st.depth = 1;
-    st.bits = 0;
-    st.lastSymbolAt = now - 120;
-    st.burstNode = 1;
-    st.burstUntil = now + BURST_MS / 2;
-    st.burstActive = true;
+    d.st.node = 1;
+    d.st.depth = 1;
+    d.st.bits = 0;
+    d.st.lastSymbolAt = now - 120;
+    d.st.burstNode = 1;
+    d.st.burstUntil = now + BURST_MS / 2;
+    d.st.burstActive = true;
   } else if (name == "hello") {
-    setText(st, "HELLO");
-    st.lastCharAt = now - 120;
-    st.charFlashActive = true;
-    st.lastCommitAt = now - 4000;
+    setTextState(d.st, "HELLO");
+    d.st.lastCharAt = now - 120;
+    d.st.charFlashActive = true;
+    d.st.lastCommitAt = now - 4000;
   } else if (name == "sos-help") {
-    setText(st, "SOS HELP");
-    st.lastCommitAt = now - 3000;
+    setTextState(d.st, "SOS HELP");
+    d.st.lastCommitAt = now - 3000;
   } else if (name == "mid-letter-s") {
-    st.node = 7;
-    st.depth = 3;
-    st.bits = 0;
-    st.lastSymbolAt = now - 300;
+    d.st.node = 7;
+    d.st.depth = 3;
+    d.st.bits = 0;
+    d.st.lastSymbolAt = now - 300;
   } else if (name == "wrapped") {
-    setText(st, "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG");
-    st.lastCommitAt = now - 5000;
+    setTextState(d.st, "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG");
+    d.st.lastCommitAt = now - 5000;
   } else if (name == "hold-dash") {
-    st.node = 5;
-    st.depth = 1;
-    st.bits = 1;
-    st.lastSymbolAt = now - 80;
-    st.burstNode = 5;
-    st.burstUntil = now + BURST_MS / 2;
-    st.burstActive = true;
+    d.st.node = 5;
+    d.st.depth = 1;
+    d.st.bits = 1;
+    d.st.lastSymbolAt = now - 80;
+    d.st.burstNode = 5;
+    d.st.burstUntil = now + BURST_MS / 2;
+    d.st.burstActive = true;
     // show held-dash preview + pressed countdown
-    uiFull(st, now);
-    uiPattern(st, PREVIEW_DASH, now);
-    uiProgress(st, true, now);
+    selectDevice(d, link);
+    uiFull(d.st, now);
+    uiPattern(d.st, PREVIEW_DASH, now);
+    uiProgress(d.st, true, now);
     return;
   } else if (name == "hold-clear") {
-    setText(st, "SOS HELP");
-    uiFull(st, now);
-    uiPattern(st, PREVIEW_CLEAR, now);
+    setTextState(d.st, "SOS HELP");
+    selectDevice(d, link);
+    uiFull(d.st, now);
+    uiPattern(d.st, PREVIEW_CLEAR, now);
     return;
   } else if (name == "hold-menu") {
-    setText(st, "SOS HELP");
-    uiFull(st, now);
+    setTextState(d.st, "SOS HELP");
+    selectDevice(d, link);
+    uiFull(d.st, now);
     uiBadge(2, now);
-    uiPattern(st, PREVIEW_ACTIONS, now);
+    uiPattern(d.st, PREVIEW_ACTIONS, now);
     return;
   } else if (name == "menu") {
-    setText(st, "HELLO");
-    uiFull(st, now);
+    setTextState(d.st, "HELLO");
+    selectDevice(d, link);
+    uiFull(d.st, now);
     uiBadge(2, now);
-    inboxPush("ARE YOU OK", now);
-    inboxPush("MEET AT SIX", now);
+    inboxPush(d, "ARE YOU OK", now);
+    inboxPush(d, "MEET AT SIX", now);
     // inboxPush paints badges; repaint compose then open the sheet
-    uiFull(st, now);
-    uiBadge(inboxCount, now);
-    appMode = MODE_ACTIONS;
-    actionSel = 0;
-    rebuildActions();
-    uiActionSheet(actionPtrs, actionCount, actionSel, now);
+    selectDevice(d, link);
+    uiFull(d.st, now);
+    uiBadge(d.inboxCount, now);
+    d.appMode = MODE_ACTIONS;
+    d.actionSel = 0;
+    rebuildActions(d);
+    uiActionSheet(d.actionPtrs, d.actionCount, d.actionSel, now);
     return;
   } else if (name == "badge") {
-    setText(st, "HELLO");
-    uiFull(st, now);
+    setTextState(d.st, "HELLO");
+    selectDevice(d, link);
+    uiFull(d.st, now);
     uiBadge(3, now);
     return;
   } else if (name == "message") {
-    inboxPush("HELLO ARE YOU OK MEET ME AT THE PARK AT SIX", now);
-    uiMessageCard(inbox[0].id, inbox[0].text, 1, inboxCount, false, 0, now);
+    inboxPush(d, "HELLO ARE YOU OK MEET ME AT THE PARK AT SIX", now);
+    selectDevice(d, link);
+    uiMessageCard(d.inbox[0].id, d.inbox[0].text, 1, d.inboxCount, false, 0, now);
     return;
   } else if (name == "message-menu") {
-    inboxPush("FIRST MESSAGE", now);
-    inboxPush("SECOND MESSAGE", now);
-    appMode = MODE_MESSAGE;
-    msgIdx = 0;
-    msgMenuOpen = true;
-    msgMenuSel = 0;
-    uiMessageCard(inbox[msgIdx].id, inbox[msgIdx].text,
-                  (uint8_t)(msgIdx + 1), inboxCount, true, 0, now);
+    inboxPush(d, "FIRST MESSAGE", now);
+    inboxPush(d, "SECOND MESSAGE", now);
+    selectDevice(d, link);
+    d.appMode = MODE_MESSAGE;
+    d.msgIdx = 0;
+    d.msgMenuOpen = true;
+    d.msgMenuSel = 0;
+    uiMessageCard(d.inbox[d.msgIdx].id, d.inbox[d.msgIdx].text,
+                  (uint8_t)(d.msgIdx + 1), d.inboxCount, true, 0, now);
     return;
   }
-  uiFull(st, now);
-  uiBadge(inboxCount, now);
-  if (name == "e-selected") uiProgress(st, false, now);
-  if (name == "mid-letter-s") {
-    // countdown visible
-  }
+  selectDevice(d, link);
+  uiFull(d.st, now);
+  uiBadge(d.inboxCount, now);
 }
 
 // -----------------------------------------------------------------------------
 // Framebuffer encoding
 // -----------------------------------------------------------------------------
-static void framebufferRGB888(std::vector<uint8_t>& out) {
-  const auto& fb = display.framebuffer();
+static void framebufferRGB888(DeviceSim& d, std::vector<uint8_t>& out) {
+  const auto& fb = d.display.framebuffer();
   out.resize((size_t)SCREEN_W * SCREEN_H * 3);
   for (size_t i = 0; i < (size_t)SCREEN_W * SCREEN_H; i++) {
     uint16_t c = fb[i];
@@ -570,9 +1205,9 @@ static void framebufferRGB888(std::vector<uint8_t>& out) {
   }
 }
 
-static void writePPM(const std::string& path) {
+static void writePPM(DeviceSim& d, const std::string& path) {
   std::vector<uint8_t> rgb;
-  framebufferRGB888(rgb);
+  framebufferRGB888(d, rgb);
   FILE* f = fopen(path.c_str(), "wb");
   if (!f) return;
   fprintf(f, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
@@ -581,9 +1216,9 @@ static void writePPM(const std::string& path) {
 }
 
 // BMP (24-bit, bottom-up) so screenshots open everywhere.
-static std::vector<uint8_t> encodeBMP() {
+static std::vector<uint8_t> encodeBMP(DeviceSim& d) {
   std::vector<uint8_t> rgb;
-  framebufferRGB888(rgb);
+  framebufferRGB888(d, rgb);
   int rowPad = (4 - (SCREEN_W * 3) % 4) % 4;
   int rowSize = SCREEN_W * 3 + rowPad;
   int imgSize = rowSize * SCREEN_H;
@@ -613,74 +1248,122 @@ static std::vector<uint8_t> encodeBMP() {
   return bmp;
 }
 
-static std::string jsonEscape(const char* s) {
+static std::string jsonEscapeC(const char* s) {
   std::string esc;
   for (const char* p = s; *p; p++) {
     char c = *p;
     if (c == '"' || c == '\\') {
       esc += '\\';
       esc += c;
+    } else if (c == '\n') {
+      esc += "\\n";
     } else if (c >= 32 && c < 127) {
       esc += c;
     } else {
       char tmp[8];
-      snprintf(tmp, sizeof(tmp), "\\u%04x", c);
+      snprintf(tmp, sizeof(tmp), "\\u%04x", (unsigned char)c);
       esc += tmp;
     }
   }
   return esc;
 }
 
-static std::string stateJSON() {
+static const char* linkName(uint8_t link) {
+  if (link == LINK_OK) return "online";
+  if (link == LINK_WIFI) return "wifi-only";
+  return "offline";
+}
+
+static std::string stateJSON(DeviceSim& d) {
   uint32_t now = vnow();
-  std::string esc = jsonEscape(st.text);
-  char letter = MORSE_NODES[st.node].letter ? MORSE_NODES[st.node].letter : '.';
-  const char* modeStr = appMode == MODE_COMPOSE ? "compose"
-                        : appMode == MODE_ACTIONS ? "actions"
-                                                  : "message";
-  char buf[2048];
+  std::string esc = jsonEscapeC(d.st.text);
+  char letter = MORSE_NODES[d.st.node].letter ? MORSE_NODES[d.st.node].letter : '.';
+  const char* modeStr = d.appMode == MODE_COMPOSE ? "compose"
+                        : d.appMode == MODE_ACTIONS ? "actions"
+                                                   : "message";
+  uint8_t link;
+  std::string relayError;
+  std::string token;
+  long long lastSeq = 0;
+  bool wifiOn = true;
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    link = d.wifiOn ? d.link : (uint8_t)LINK_OFF;
+    relayError = d.relayError;
+    token = d.token;
+    lastSeq = d.lastSeq;
+    wifiOn = d.wifiOn;
+  }
+  char buf[4096];
   snprintf(buf, sizeof(buf),
-           "{\"now\":%u,\"node\":%u,\"nodeLetter\":\"%c\",\"depth\":%u,"
+           "{\"id\":\"%s\",\"now\":%u,\"node\":%u,\"nodeLetter\":\"%c\",\"depth\":%u,"
            "\"text\":\"%s\",\"pressed\":%s,\"preview\":%u,"
            "\"mode\":\"%s\",\"unread\":%u,\"nextId\":%u,"
            "\"msgIdx\":%u,\"msgMenu\":%s,\"msgMenuSel\":%u,"
-           "\"actionSel\":%u}",
-           now, st.node, letter, st.depth, esc.c_str(),
-           (virtDown || inPressed) ? "true" : "false", previewState, modeStr,
-           (unsigned)inboxCount, (unsigned)nextMsgId, (unsigned)msgIdx,
-           msgMenuOpen ? "true" : "false", (unsigned)msgMenuSel,
-           (unsigned)actionSel);
+           "\"actionSel\":%u,\"link\":%u,\"linkName\":\"%s\","
+           "\"wifi\":%s,\"hasToken\":%s,\"lastSeq\":%lld,"
+           "\"relayHost\":\"%s\",\"relayPort\":%d,"
+           "\"relayError\":\"%s\"}",
+           d.id.c_str(), now, d.st.node, letter, d.st.depth, esc.c_str(),
+           (d.virtDown || d.inPressed) ? "true" : "false", d.previewState, modeStr,
+           (unsigned)d.inboxCount, (unsigned)d.nextMsgId, (unsigned)d.msgIdx,
+           d.msgMenuOpen ? "true" : "false", (unsigned)d.msgMenuSel,
+           (unsigned)d.actionSel, (unsigned)link, linkName(link),
+           wifiOn ? "true" : "false", token.empty() ? "false" : "true",
+           (long long)lastSeq, jsonEscapeC(g_relayHost.c_str()).c_str(), g_relayPort,
+           jsonEscapeC(relayError.c_str()).c_str());
   std::string out(buf);
   // inbox: newest-first [{id,text}]
   out.pop_back(); // remove }
   out += ",\"inbox\":[";
-  for (uint8_t i = 0; i < inboxCount; i++) {
+  for (uint8_t i = 0; i < d.inboxCount; i++) {
     if (i) out += ",";
     char ib[64];
     snprintf(ib, sizeof(ib), "{\"id\":%u,\"text\":\"",
-             (unsigned)inbox[i].id);
+             (unsigned)d.inbox[i].id);
     out += ib;
-    out += jsonEscape(inbox[i].text);
+    out += jsonEscapeC(d.inbox[i].text);
     out += "\"}";
   }
   out += "],\"actions\":[";
-  for (uint8_t i = 0; i < actionCount; i++) {
+  for (uint8_t i = 0; i < d.actionCount; i++) {
     if (i) out += ",";
     out += "\"";
-    out += jsonEscape(actionPtrs[i] ? actionPtrs[i] : "");
+    out += jsonEscapeC(d.actionPtrs[i] ? d.actionPtrs[i] : "");
     out += "\"";
   }
   out += "]";
-  if (appMode == MODE_MESSAGE && inboxCount > 0 && msgIdx < inboxCount) {
+  if (d.appMode == MODE_MESSAGE && d.inboxCount > 0 && d.msgIdx < d.inboxCount) {
     char mb[64];
-    snprintf(mb, sizeof(mb), ",\"msgId\":%u,", (unsigned)inbox[msgIdx].id);
+    snprintf(mb, sizeof(mb), ",\"msgId\":%u,", (unsigned)d.inbox[d.msgIdx].id);
     out += mb;
     out += "\"msgText\":\"";
-    out += jsonEscape(inbox[msgIdx].text);
+    out += jsonEscapeC(d.inbox[d.msgIdx].text);
     out += "\"";
   }
   out += "}";
   return out;
+}
+
+static std::string relayJSON() {
+  auto one = [](DeviceSim& d) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    uint8_t link = d.wifiOn ? d.link : (uint8_t)LINK_OFF;
+    char b[1024];
+    snprintf(b, sizeof(b),
+             "{\"id\":\"%s\",\"wifi\":%s,\"link\":%u,\"linkName\":\"%s\","
+             "\"hasToken\":%s,\"lastSeq\":%lld,\"error\":\"%s\"}",
+             d.id.c_str(), d.wifiOn ? "true" : "false", (unsigned)link,
+             linkName(link), d.token.empty() ? "false" : "true",
+             (long long)d.lastSeq, jsonEscapeC(d.relayError.c_str()).c_str());
+    return std::string(b);
+  };
+  char head[512];
+  snprintf(head, sizeof(head),
+           "{\"host\":\"%s\",\"port\":%d,\"enabled\":%s,\"dad\":",
+           jsonEscapeC(g_relayHost.c_str()).c_str(), g_relayPort,
+           g_relayEnabled.load() ? "true" : "false");
+  return std::string(head) + one(g_dad) + ",\"emma\":" + one(g_emma) + "}";
 }
 
 // -----------------------------------------------------------------------------
@@ -710,99 +1393,61 @@ static void sendAll(int fd, const char* p, size_t n) {
   }
 }
 
-static void handleClient(int fd) {
-  char req[8192];
-  ssize_t nr = recv(fd, req, sizeof(req) - 1, 0);
-  if (nr <= 0) return;
-  req[nr] = '\0';
-  std::string r(req, (size_t)nr);
+static void sendJSON(int fd, const std::string& payload, int code = 200) {
+  const char* reason = code == 200 ? "OK" : (code == 400 ? "Bad Request" : "Not Found");
+  std::string head = "HTTP/1.0 " + std::to_string(code) + " " + reason +
+                     "\r\nContent-Type: application/json\r\nContent-Length: " +
+                     std::to_string(payload.size()) +
+                     "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+  sendAll(fd, head.c_str(), head.size());
+  sendAll(fd, payload.c_str(), payload.size());
+}
 
-  char method[8] = {0}, path[256] = {0};
-  sscanf(r.c_str(), "%7s %255s", method, path);
-  std::string body;
-  size_t hdrEnd = r.find("\r\n\r\n");
-  if (hdrEnd != std::string::npos) body = r.substr(hdrEnd + 4);
-  // If Content-Length says more is coming, read it.
-  size_t clPos = r.find("Content-Length:");
-  if (clPos != std::string::npos && hdrEnd != std::string::npos) {
-    int cl = atoi(r.c_str() + clPos + 15);
-    while ((int)body.size() < cl) {
-      ssize_t m = recv(fd, req, sizeof(req), 0);
-      if (m <= 0) break;
-      body.append(req, (size_t)m);
-    }
-  }
-
+static void handleDeviceClient(int fd, DeviceSim& d, const std::string& sub,
+                               const std::string& method, const std::string& body) {
   uint32_t now = vnow();
-  tick(now);
+  tickDevice(g_dad, now);
+  tickDevice(g_emma, now);
+  now = vnow();
 
-  std::string head, payload;
-  std::vector<uint8_t> payloadBin;
-  bool isBin = false;
-
-  if (!strcmp(path, "/") || !strcmp(path, "/index.html")) {
-    payload = readFile(g_indexPath);
-    if (payload.empty()) payload = "<h1>index.html missing</h1>";
-    head = "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: " +
-           std::to_string(payload.size()) + "\r\nConnection: close\r\n\r\n";
+  if (sub == "state" || sub == "messages") {
+    sendJSON(fd, stateJSON(d));
+  } else if (sub == "frame.raw") {
+    std::vector<uint8_t> bin;
+    framebufferRGB888(d, bin);
+    std::string head = "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                       "Content-Length: " +
+                       std::to_string(bin.size()) +
+                       "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
     sendAll(fd, head.c_str(), head.size());
-    sendAll(fd, payload.c_str(), payload.size());
-    return;
-  } else if (!strcmp(path, "/api/state")) {
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/frame.raw")) {
-    framebufferRGB888(payloadBin);
-    isBin = true;
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n"
-           "Content-Length: " +
-           std::to_string(payloadBin.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/frame.bmp") || !strcmp(path, "/frame.bmp")) {
-    payloadBin = encodeBMP();
-    isBin = true;
-    head = "HTTP/1.0 200 OK\r\nContent-Type: image/bmp\r\nContent-Length: " +
-           std::to_string(payloadBin.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/press") && !strcmp(method, "POST")) {
+    sendAll(fd, (const char*)bin.data(), bin.size());
+  } else if (sub == "frame.bmp") {
+    std::vector<uint8_t> bin = encodeBMP(d);
+    std::string head = "HTTP/1.0 200 OK\r\nContent-Type: image/bmp\r\nContent-Length: " +
+                       std::to_string(bin.size()) +
+                       "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    sendAll(fd, head.c_str(), head.size());
+    sendAll(fd, (const char*)bin.data(), bin.size());
+  } else if (sub == "press" && method == "POST") {
     if (body.find("down") != std::string::npos)
-      virtDown = true;
+      d.virtDown = true;
     else if (body.find("up") != std::string::npos)
-      virtDown = false;
+      d.virtDown = false;
     else if (body.find("true") != std::string::npos)
-      virtDown = true;
+      d.virtDown = true;
     else if (body.find("false") != std::string::npos)
-      virtDown = false;
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/scene") && !strcmp(method, "POST")) {
-    // body: {"scene":"hello"} or plain name
+      d.virtDown = false;
+    sendJSON(fd, stateJSON(d));
+  } else if (sub == "scene" && method == "POST") {
     std::string name = "root";
-    size_t q = body.find("\"scene\"");
-    if (q != std::string::npos) {
-      size_t c = body.find(':', q);
-      size_t q1 = body.find('"', c);
-      size_t q2 = body.find('"', q1 + 1);
-      if (q1 != std::string::npos && q2 != std::string::npos)
-        name = body.substr(q1 + 1, q2 - q1 - 1);
+    std::string v;
+    if (jsonStringVal(body, "scene", v) && !v.empty()) {
+      name = v;
     } else if (!body.empty()) {
-      name = body;
-      // trim quotes/whitespace
       std::string t;
-      for (char ch : name)
+      for (char ch : body)
         if (ch != '"' && ch != '\'' && ch != ' ' && ch != '\n' && ch != '\r')
           t += ch;
-      // allow {"scene":...} fallback already handled; else raw path form
       size_t b = t.find(':');
       if (b != std::string::npos) t = t.substr(b + 1);
       size_t a = t.find('{');
@@ -811,47 +1456,21 @@ static void handleClient(int fd) {
         t = t.substr(a + 1, z - a - 1);
       if (!t.empty()) name = t;
     }
-    applyScene(name);
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/text") && !strcmp(method, "POST")) {
+    applyScene(d, name);
+    sendJSON(fd, stateJSON(d));
+  } else if (sub == "text" && method == "POST") {
     std::string t;
-    size_t q = body.find("\"text\"");
-    if (q != std::string::npos) {
-      size_t c = body.find(':', q);
-      size_t q1 = body.find('"', c);
-      size_t q2 = body.find('"', q1 + 1);
-      if (q1 != std::string::npos && q2 != std::string::npos)
-        t = body.substr(q1 + 1, q2 - q1 - 1);
-    }
+    jsonStringVal(body, "text", t);
     uint32_t n2 = vnow();
-    resetSim(n2);
-    setText(st, t.c_str());
-    uiFull(st, n2);
-    uiBadge(inboxCount, n2);
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/receive") && !strcmp(method, "POST")) {
-    // Simulate an incoming message. Body: {"text":"HELLO"} or plain text.
-    // Empty body cycles through sample texts. Each gets a unique id.
+    resetSim(d, n2);
+    setTextState(d.st, t.c_str());
+    redrawCompose(d, n2);
+    sendJSON(fd, stateJSON(d));
+  } else if (sub == "receive" && method == "POST") {
+    // Local inject (offline-style). Empty body cycles through samples.
     std::string t;
-    size_t q = body.find("\"text\"");
-    if (q != std::string::npos) {
-      size_t c = body.find(':', q);
-      size_t q1 = body.find('"', c);
-      size_t q2 = body.find('"', q1 + 1);
-      if (q1 != std::string::npos && q2 != std::string::npos)
-        t = body.substr(q1 + 1, q2 - q1 - 1);
-    } else if (!body.empty()) {
-      // plain text (trim whitespace/quotes)
+    jsonStringVal(body, "text", t);
+    if (t.empty() && !body.empty() && body.find('{') == std::string::npos) {
       std::string u;
       for (char ch : body)
         if (ch != '\r' && ch != '\n') u += ch;
@@ -871,44 +1490,153 @@ static void handleClient(int fd) {
       t = samples[si];
       si = (si + 1) % 5;
     }
-    // Cap to display length.
     if (t.size() > MSG_TEXT_MAX) t.resize(MSG_TEXT_MAX);
-    inboxPush(t.c_str(), vnow());
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/messages")) {
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
-  } else if (!strcmp(path, "/api/clear") && !strcmp(method, "POST")) {
-    clearTextSim(vnow());
-    payload = stateJSON();
-    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
-           "Content-Length: " +
-           std::to_string(payload.size()) +
-           "\r\nConnection: close\r\nAccess-Control-Allow-Origin: "
-           "*\r\n\r\n";
+    inboxPush(d, t.c_str(), vnow());
+    sendJSON(fd, stateJSON(d));
+  } else if (sub == "send" && method == "POST") {
+    // Queue text for delivery via the REAL relay (same path as Morse SEND).
+    std::string t;
+    jsonStringVal(body, "text", t);
+    while (!t.empty() && isspace((unsigned char)t.front())) t.erase(t.begin());
+    while (!t.empty() && isspace((unsigned char)t.back())) t.pop_back();
+    if (t.empty()) {
+      sendJSON(fd, "{\"error\":\"empty text\"}", 400);
+      return;
+    }
+    if (t.size() > MSG_TEXT_MAX) t.resize(MSG_TEXT_MAX);
+    queueSend(d, t.c_str());
+    sendJSON(fd, "{\"queued\":true}");
+  } else if (sub == "wifi" && method == "POST") {
+    bool on = true;
+    bool v = true;
+    if (jsonBoolVal(body, "on", v)) {
+      on = v;
+    } else if (body.find("off") != std::string::npos) {
+      on = false;
+    } else if (body.find("false") != std::string::npos) {
+      on = false;
+    }
+    {
+      std::lock_guard<std::mutex> lk(d.mtx);
+      d.wifiOn = on;
+      if (!on) setLinkLocked(d, LINK_OFF, "wifi off (sim toggle)");
+    }
+    sendJSON(fd, stateJSON(d));
+  } else if (sub == "clear" && method == "POST") {
+    clearTextSim(d, vnow());
+    sendJSON(fd, stateJSON(d));
   } else {
-    payload = "{\"error\":\"not found\"}";
-    head = "HTTP/1.0 404 Not Found\r\nContent-Type: "
-           "application/json\r\nContent-Length: " +
-           std::to_string(payload.size()) + "\r\nConnection: close\r\n\r\n";
+    sendJSON(fd, "{\"error\":\"not found\"}", 404);
+  }
+}
+
+static void handleClient(int fd) {
+  char req[8192];
+  ssize_t nr = recv(fd, req, sizeof(req) - 1, 0);
+  if (nr <= 0) return;
+  req[nr] = '\0';
+  std::string r(req, (size_t)nr);
+
+  char method[8] = {0}, path[256] = {0};
+  sscanf(r.c_str(), "%7s %255s", method, path);
+  std::string body;
+  size_t hdrEnd = r.find("\r\n\r\n");
+  if (hdrEnd != std::string::npos) body = r.substr(hdrEnd + 4);
+  size_t clPos = r.find("Content-Length:");
+  if (clPos != std::string::npos && hdrEnd != std::string::npos) {
+    int cl = atoi(r.c_str() + clPos + 15);
+    while ((int)body.size() < cl) {
+      ssize_t m = recv(fd, req, sizeof(req), 0);
+      if (m <= 0) break;
+      body.append(req, (size_t)m);
+    }
   }
 
-  if (isBin) {
-    sendAll(fd, head.c_str(), head.size());
-    sendAll(fd, (const char*)payloadBin.data(), payloadBin.size());
-  } else {
+  std::string p(path);
+  // Strip query string for routing.
+  size_t q = p.find('?');
+  if (q != std::string::npos) p = p.substr(0, q);
+
+  if (p == "/" || p == "/index.html") {
+    std::string payload = readFile(g_indexPath);
+    if (payload.empty()) payload = "<h1>index.html missing</h1>";
+    std::string head = "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: " +
+                       std::to_string(payload.size()) + "\r\nConnection: close\r\n\r\n";
     sendAll(fd, head.c_str(), head.size());
     sendAll(fd, payload.c_str(), payload.size());
+    return;
   }
+
+  if (p == "/api/relay" && std::string(method) == "GET") {
+    tickDevice(g_dad, vnow());
+    tickDevice(g_emma, vnow());
+    sendJSON(fd, relayJSON());
+    return;
+  }
+
+  if (p == "/api/relay" && std::string(method) == "POST") {
+    std::string host, dadToken, emmaToken;
+    long long port = 0;
+    bool enabled = true;
+    bool hasEnabled = jsonBoolVal(body, "enabled", enabled);
+    if (jsonStringVal(body, "host", host)) g_relayHost = host;
+    if (jsonIntVal(body, "port", port) && port >= 1 && port <= 65535)
+      g_relayPort = (int)port;
+    if (hasEnabled) g_relayEnabled = enabled;
+    if (jsonStringVal(body, "dadToken", dadToken)) {
+      std::lock_guard<std::mutex> lk(g_dad.mtx);
+      g_dad.token = dadToken;
+    }
+    if (jsonStringVal(body, "emmaToken", emmaToken)) {
+      std::lock_guard<std::mutex> lk(g_emma.mtx);
+      g_emma.token = emmaToken;
+    }
+    // A token change may unstick auth errors: reset the error text so the
+    // next poll cycle reports fresh state instead of a stale 401.
+    {
+      std::lock_guard<std::mutex> lk(g_dad.mtx);
+      std::lock_guard<std::mutex> lk2(g_emma.mtx);
+      if (g_dad.relayError.find("auth") != std::string::npos)
+        g_dad.relayError = "retrying";
+      if (g_emma.relayError.find("auth") != std::string::npos)
+        g_emma.relayError = "retrying";
+    }
+    sendJSON(fd, relayJSON());
+    return;
+  }
+
+  // /api/<dev>/<sub> (new) or legacy /api/<sub> (dad).
+  const std::string prefix = "/api/";
+  if (p.compare(0, prefix.size(), prefix) == 0) {
+    std::string rest = p.substr(prefix.size());
+    size_t slash = rest.find('/');
+    if (slash != std::string::npos) {
+      std::string maybeDev = rest.substr(0, slash);
+      if (DeviceSim* dev = devById(maybeDev)) {
+        handleDeviceClient(fd, *dev, rest.substr(slash + 1), method, body);
+        return;
+      }
+      // Unknown /api/<x>/... — 404 rather than guessing dad.
+      sendJSON(fd, "{\"error\":\"unknown device (use dad or emma)\"}", 404);
+      return;
+    }
+    // Legacy single-device paths map to dad.
+    handleDeviceClient(fd, g_dad, rest, method, body);
+    return;
+  }
+
+  // Legacy frame alias.
+  if (p == "/frame.bmp") {
+    std::vector<uint8_t> bin = encodeBMP(g_dad);
+    std::string head = "HTTP/1.0 200 OK\r\nContent-Type: image/bmp\r\nContent-Length: " +
+                       std::to_string(bin.size()) +
+                       "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    sendAll(fd, head.c_str(), head.size());
+    sendAll(fd, (const char*)bin.data(), bin.size());
+    return;
+  }
+
+  sendJSON(fd, "{\"error\":\"not found\"}", 404);
 }
 
 int main(int argc, char** argv) {
@@ -919,6 +1647,25 @@ int main(int argc, char** argv) {
     if (!strncmp(argv[i], "--port=", 7)) port = atoi(argv[i] + 7);
     if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
     if (!strcmp(argv[i], "--index") && i + 1 < argc) g_indexPath = argv[++i];
+    if (!strncmp(argv[i], "--relay=", 8)) {
+      std::string v = argv[i] + 8;
+      size_t c = v.rfind(':');
+      if (c != std::string::npos) {
+        g_relayHost = v.substr(0, c);
+        g_relayPort = atoi(v.substr(c + 1).c_str());
+      } else {
+        g_relayHost = v;
+      }
+    }
+    if (!strncmp(argv[i], "--dad-token=", 12)) {
+      std::lock_guard<std::mutex> lk(g_dad.mtx);
+      g_dad.token = argv[i] + 12;
+    }
+    if (!strncmp(argv[i], "--emma-token=", 13)) {
+      std::lock_guard<std::mutex> lk(g_emma.mtx);
+      g_emma.token = argv[i] + 13;
+    }
+    if (!strcmp(argv[i], "--no-relay")) g_relayEnabled = false;
   }
   // Resolve index.html relative to CWD or binary location dir candidates.
   if (readFile(g_indexPath).empty()) {
@@ -932,11 +1679,17 @@ int main(int argc, char** argv) {
     }
   }
 
+  loadRelayConfigFromEnv();
+
   bootTp = std::chrono::steady_clock::now();
-  display.init(SCREEN_W, SCREEN_H);
-  display.setRotation(DISPLAY_ROTATION);
-  uiBegin(&display);
-  resetSim(vnow());
+  g_dad.display.init(SCREEN_W, SCREEN_H);
+  g_dad.display.setRotation(DISPLAY_ROTATION);
+  g_emma.display.init(SCREEN_W, SCREEN_H);
+  g_emma.display.setRotation(DISPLAY_ROTATION);
+  uiBegin(&g_dad.display);
+  resetSim(g_dad, vnow());
+  uiBegin(&g_emma.display);
+  resetSim(g_emma, vnow());
 
   if (!dumpDir.empty()) {
     const char* scenes[] = {"root",       "e-selected", "hello",
@@ -950,17 +1703,21 @@ int main(int argc, char** argv) {
                             "09-badge",      "10-message",    "11-message-menu",
                             nullptr};
     for (int i = 0; scenes[i]; i++) {
-      applyScene(scenes[i]);
+      applyScene(g_dad, scenes[i]);
       std::string p = dumpDir + "/" + fnames[i] + ".ppm";
-      writePPM(p);
+      writePPM(g_dad, p);
       printf("  %s\n", p.c_str());
     }
     return 0;
   }
 
+  std::thread relayThread(relayLoop);
+
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   if (srv < 0) {
     perror("socket");
+    g_running = false;
+    relayThread.join();
     return 1;
   }
   int opt = 1;
@@ -971,18 +1728,25 @@ int main(int argc, char** argv) {
   addr.sin_port = htons((uint16_t)port);
   if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
     perror("bind");
+    g_running = false;
+    relayThread.join();
     return 1;
   }
   if (listen(srv, 8) < 0) {
     perror("listen");
+    g_running = false;
+    relayThread.join();
     return 1;
   }
   printf("morse-code sim: http://localhost:%d/  (index: %s)\n", port,
          g_indexPath.c_str());
+  printf("relay: %s:%d dad-token:%s emma-token:%s\n", g_relayHost.c_str(),
+         g_relayPort, g_dad.token.empty() ? "MISSING" : "set",
+         g_emma.token.empty() ? "MISSING" : "set");
   printf("same renderer as the panel: uiFull/uiPattern/uiResult/uiProgress\n");
   fflush(stdout);
 
-  while (true) {
+  while (g_running) {
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(srv, &rfds);
@@ -995,7 +1759,12 @@ int main(int argc, char** argv) {
         close(fd);
       }
     }
-    tick(vnow());
+    uint32_t now = vnow();
+    tickDevice(g_dad, now);
+    tickDevice(g_emma, now);
   }
+
+  close(srv);
+  relayThread.join();
   return 0;
 }

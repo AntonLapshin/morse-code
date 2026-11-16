@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>morse-code sim — ESP32 + ST7789</title>
+<title>morse-code sim — Dad + Emma via relay</title>
 <style>
   :root { color-scheme: dark; }
   body { background:#080c18; color:#d8e2f4; font-family:ui-monospace,Menlo,Consolas,monospace; margin:0; padding:16px; }
@@ -12,151 +12,283 @@
   p.sub code { color:#9fb4d8; }
   .wrap { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
   .panel { background:#0c1222; border:1px solid #28344e; border-radius:10px; padding:12px; }
-  canvas#lcd { width:340px; height:640px; image-rendering:pixelated; background:#080c18; border:1px solid #28344e; border-radius:6px; touch-action:none; }
+  .panel h2 { font-size:13px; margin:0 0 8px; letter-spacing:1px; }
+  .panel h2 .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:baseline; }
+  canvas.lcd { width:340px; height:640px; image-rendering:pixelated; background:#080c18; border:1px solid #28344e; border-radius:6px; touch-action:none; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; align-items:center; }
   button { background:#16203a; color:#d8e2f4; border:1px solid #33415e; border-radius:6px; padding:6px 10px; font:inherit; font-size:12px; cursor:pointer; }
   button:hover { border-color:#7e94b4; }
-  button.active { border-color:#46eb37; color:#b2ffa0; }
   button.boot { font-size:15px; padding:14px 18px; border-width:2px; user-select:none; -webkit-user-select:none; }
   button.boot.held { background:#12330f; border-color:#46eb37; color:#b2ffa0; }
   button.recv { border-color:#7e5a1e; }
-  input[type=text] { background:#0a0f1e; color:#fff; border:1px solid #33415e; border-radius:6px; padding:6px 8px; font:inherit; font-size:12px; width:220px; }
+  button.sendbtn { border-color:#1f6f2e; }
+  input[type=text], input[type=password] { background:#0a0f1e; color:#fff; border:1px solid #33415e; border-radius:6px; padding:6px 8px; font:inherit; font-size:12px; width:200px; }
+  input.short { width:150px; }
+  input.tiny { width:70px; }
   .meta { font-size:12px; color:#9fb4d8; white-space:pre-wrap; }
   .meta b { color:#fff; }
   .badge { display:inline-block; min-width:10px; text-align:center; background:#a4161a; color:#fff; border-radius:8px; padding:0 6px; font-size:11px; margin-left:6px; }
   .badge.zero { background:#24304a; color:#8fa0ba; }
-  .hint { font-size:11px; color:#5c6b86; max-width:440px; line-height:1.5; }
+  .hint { font-size:11px; color:#5c6b86; max-width:460px; line-height:1.5; }
+  .err { color:#ff8a7a; }
+  .ok { color:#7dffa8; }
+  .warn { color:#ffb35c; }
+  #relaybar { border-color:#3a4a6a; }
+  #relaybar h2 { color:#9fd0ff; }
   a { color:#9fd0ff; }
 </style>
 </head>
 <body>
-<h1>MORSE-CODE SIM <span id="unreadTop"></span></h1>
-<p class="sub">Same renderer as the panel on <code>170×320</code>. Long-hold BOOT opens the action menu; incoming messages show a <code>N NEW</code> badge.</p>
-<div class="wrap">
-  <div class="panel">
-    <canvas id="lcd" width="170" height="320"></canvas>
-    <div class="row">
-      <button id="boot" class="boot">● BOOT (hold)</button>
-      <button id="shot">⇩ screenshot BMP</button>
-    </div>
-    <div class="row">
-      <button id="tap">tap = dot</button>
-      <button id="dash">hold 300ms = dash</button>
-      <button id="holdmenu">hold 1.6s = menu</button>
-      <button id="clear">clear</button>
-    </div>
-    <div class="row">
-      <input id="rxtext" type="text" value="HELLO ARE YOU OK" maxlength="96">
-      <button id="receive" class="recv">⇩ receive message</button>
-    </div>
+<h1>MORSE-CODE SIM — DAD + EMMA <span id="unreadTop"></span></h1>
+<p class="sub">Two virtual ESP32s with the real panel renderer (<code>170×320</code>). <b>SEND</b> (Morse action sheet or the send box) posts to the <b>real relay</b> and appears on the other panel. Top-left dot: <b style="color:#ff5a4e">red</b>=no wifi, <b style="color:#ff9f0a">orange</b>=wifi ok / relay down, <b style="color:#46eb37">green</b>=both ok.</p>
+
+<div class="panel" id="relaybar">
+  <h2>RELAY <span id="relayDot"></span></h2>
+  <div class="row">
+    <label>host <input id="rhost" class="short" type="text" value="192.168.4.44"></label>
+    <label>port <input id="rport" class="tiny" type="text" value="8180"></label>
+    <button id="rsave">save</button>
+    <span id="rstatus" class="meta">…</span>
   </div>
-  <div class="panel">
-    <div class="row" id="scenes"></div>
+  <div class="row">
+    <label>dad token <input id="rdad" type="password" value=""></label>
+    <label>emma token <input id="remma" type="password" value=""></label>
+  </div>
+  <p class="hint">Tokens live in the relay machine's <code>.env</code> (<code>MORSE_TOKEN_DAD / _EMMA</code>). This laptop's <code>.env</code> may differ — if the dot stays orange with a <code>401</code> error, paste the relay's tokens here and press save. A <code>401</code> always means token mismatch, not a broken server.</p>
+</div>
+
+<div class="wrap" style="margin-top:12px">
+  <div class="panel" id="panel-dad">
+    <h2><span class="dot" id="dot-dad"></span>DAD <span id="unread-dad"></span></h2>
+    <canvas class="lcd" id="lcd-dad" width="170" height="320"></canvas>
     <div class="row">
-      <input id="text" type="text" value="SOS HELP" maxlength="96">
-      <button id="settext">set text</button>
+      <button id="boot-dad" class="boot">● BOOT (hold)</button>
+      <button id="shot-dad">⇩ BMP</button>
     </div>
-    <div class="meta" id="state">…</div>
-    <div class="meta" id="inbox"></div>
-    <p class="hint">Keys: <b>Space</b> = BOOT (tap dot / hold dash / hold 1.5s menu), <b>C</b> = clear, <b>R</b> = receive. Display polls <code>/api/frame.raw</code> at ~30fps.</p>
-    <p class="hint"><b>COMPOSE:</b> type Morse. Long-hold opens the menu (<code>SEND</code> / <code>CLEAR</code> / <code>READ n</code> / <code>CLOSE</code>). Tap cycles, long-hold picks. <b>SEND</b> clears the buffer (simulates a send).<br><b>MESSAGE:</b> tap = read this message (it is gone) + show next. Long-hold opens <code>NEXT</code> / <code>CLOSE</code>: tap cycles, long-hold picks. A read message is removed and the <code>N NEW</code> badge counts what is left. Each message has a unique <code>#id</code>.</p>
-    <p class="hint">Scenes: root, e-selected, hello, sos-help, mid-letter-s, wrapped, hold-dash, hold-menu, menu, badge, message, message-menu.</p>
+    <div class="row">
+      <button data-dev="dad" data-act="tap">tap = dot</button>
+      <button data-dev="dad" data-act="dash">hold 300ms = dash</button>
+      <button data-dev="dad" data-act="holdmenu">hold 1.6s = menu</button>
+      <button data-dev="dad" data-act="clear">clear</button>
+      <button data-dev="dad" data-act="wifi">wifi on/off</button>
+    </div>
+    <div class="row">
+      <input id="send-dad" type="text" value="HELLO DAD" maxlength="96">
+      <button id="sendbtn-dad" class="sendbtn">⇧ send via relay</button>
+    </div>
+    <div class="row">
+      <input id="rx-dad" type="text" value="HELLO ARE YOU OK" maxlength="96">
+      <button id="recv-dad" class="recv">⇩ receive (local)</button>
+    </div>
+    <div class="meta" id="state-dad">…</div>
+    <div class="meta" id="inbox-dad"></div>
+  </div>
+
+  <div class="panel" id="panel-emma">
+    <h2><span class="dot" id="dot-emma"></span>EMMA <span id="unread-emma"></span></h2>
+    <canvas class="lcd" id="lcd-emma" width="170" height="320"></canvas>
+    <div class="row">
+      <button id="boot-emma" class="boot">● BOOT (hold)</button>
+      <button id="shot-emma">⇩ BMP</button>
+    </div>
+    <div class="row">
+      <button data-dev="emma" data-act="tap">tap = dot</button>
+      <button data-dev="emma" data-act="dash">hold 300ms = dash</button>
+      <button data-dev="emma" data-act="holdmenu">hold 1.6s = menu</button>
+      <button data-dev="emma" data-act="clear">clear</button>
+      <button data-dev="emma" data-act="wifi">wifi on/off</button>
+    </div>
+    <div class="row">
+      <input id="send-emma" type="text" value="HELLO EMMA" maxlength="96">
+      <button id="sendbtn-emma" class="sendbtn">⇧ send via relay</button>
+    </div>
+    <div class="row">
+      <input id="rx-emma" type="text" value="MEET AT SIX" maxlength="96">
+      <button id="recv-emma" class="recv">⇩ receive (local)</button>
+    </div>
+    <div class="meta" id="state-emma">…</div>
+    <div class="meta" id="inbox-emma"></div>
+  </div>
+
+  <div class="panel">
+    <h2>SCENES</h2>
+    <div class="row" id="scenes-dad"></div>
+    <div class="row" id="scenes-emma"></div>
+    <div class="row">
+      <input id="text-dad" type="text" value="SOS HELP" maxlength="96">
+      <button id="settext-dad">set dad text</button>
+    </div>
+    <div class="row">
+      <input id="text-emma" type="text" value="SOS HELP" maxlength="96">
+      <button id="settext-emma">set emma text</button>
+    </div>
+    <p class="hint">Keys: <b>D</b>/<b>E</b> + <b>Space</b>? No — click a BOOT button first to focus it, then <b>Space</b> drives the focused device. <b>R</b> = local receive on dad, <b>C</b> = clear dad. Display polls <code>/api/&lt;dad|emma&gt;/frame.raw</code> at ~20fps each.</p>
+    <p class="hint"><b>COMPOSE:</b> type Morse. Long-hold opens the menu (<code>SEND</code> / <code>CLEAR</code> / <code>READ n</code> / <code>CLOSE</code>) — <b>SEND</b> posts to the real relay. <b>MESSAGE:</b> tap = read this message (gone) + show next; long-hold opens <code>NEXT</code>/<code>CLOSE</code>.</p>
   </div>
 </div>
+
 <script>
-const cv = document.getElementById('lcd');
-const ctx = cv.getContext('2d');
-const img = ctx.createImageData(170, 320);
-async function frame() {
+const DEVS = ['dad', 'emma'];
+const ctxs = {}, imgs = {};
+for (const d of DEVS) {
+  const cv = document.getElementById('lcd-' + d);
+  ctxs[d] = cv.getContext('2d');
+  imgs[d] = ctxs[d].createImageData(170, 320);
+}
+function linkColor(l) { return l === 2 ? '#46eb37' : (l === 1 ? '#ff9f0a' : '#ff5a4e'); }
+async function frame(dev) {
   try {
-    const r = await fetch('/api/frame.raw', {cache:'no-store'});
+    const r = await fetch('/api/' + dev + '/frame.raw', {cache:'no-store'});
     if (!r.ok) return;
     const b = new Uint8Array(await r.arrayBuffer());
     if (b.length < 170*320*3) return;
-    const d = img.data;
+    const d = imgs[dev].data;
     for (let i=0, j=0; i<b.length; i+=3, j+=4) {
       d[j]=b[i]; d[j+1]=b[i+1]; d[j+2]=b[i+2]; d[j+3]=255;
     }
-    ctx.putImageData(img, 0, 0);
-  } catch(e) {}
-}
-async function state() {
-  try {
-    const r = await fetch('/api/state', {cache:'no-store'});
-    const s = await r.json();
-    document.getElementById('state').innerHTML =
-      'mode     <b>'+escapeHtml(s.mode||'?')+'</b>  unread <b>'+(s.unread||0)+'</b>  nextId <b>'+(s.nextId||1)+'</b>\nnode     <b>'+s.node+' ('+escapeHtml(s.nodeLetter||'')+')</b>  depth <b>'+s.depth+'</b>\ntext     <b>'+escapeHtml(s.text)+'</b>\npressed  <b>'+s.pressed+'</b>' +
-      (s.mode==='actions' ? '\nactions  <b>'+escapeHtml((s.actions||[]).join(' | '))+'</b> sel <b>'+s.actionSel+'</b>' : '') +
-      (s.mode==='message' ? '\nmsg      <b>#'+s.msgId+' '+(s.msgIdx+1)+'/'+s.unread+'</b> '+(s.msgMenu?'menu sel='+s.msgMenuSel:'tap=next hold=menu')+'\nmsgText  <b>'+escapeHtml(s.msgText||'')+'</b>' : '');
-    const ib = document.getElementById('inbox');
-    if (s.inbox && s.inbox.length) {
-      ib.innerHTML = 'inbox    ' + s.inbox.map(m => '<b>#'+m.id+'</b> '+escapeHtml(m.text)).join('\n         ');
-    } else {
-      ib.innerHTML = 'inbox    <b>(empty)</b>';
-    }
-    const top = document.getElementById('unreadTop');
-    if (s.unread > 0) top.innerHTML = '<span class="badge">'+s.unread+' NEW</span>';
-    else top.innerHTML = '<span class="badge zero">0 NEW</span>';
+    ctxs[dev].putImageData(imgs[dev], 0, 0);
   } catch(e) {}
 }
 function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-setInterval(frame, 1000/30);
-setInterval(state, 300);
-frame(); state();
+async function state(dev) {
+  try {
+    const r = await fetch('/api/' + dev + '/state', {cache:'no-store'});
+    const s = await r.json();
+    document.getElementById('dot-' + dev).style.background = linkColor(s.link);
+    document.getElementById('dot-' + dev).title = s.linkName + (s.relayError ? ' — ' + s.relayError : '');
+    let err = s.relayError ? ' <span class="' + (s.link === 2 ? 'ok' : 'warn') + '">' + escapeHtml(s.relayError) + '</span>' : ' <span class="ok">relay ok</span>';
+    document.getElementById('state-' + dev).innerHTML =
+      'link     <b>' + (s.linkName||'?') + '</b> (' + (s.wifi ? 'wifi on' : 'wifi OFF') + ') lastSeq <b>' + (s.lastSeq||0) + '</b><br>relay    ' + err +
+      '<br>mode     <b>'+escapeHtml(s.mode||'?')+'</b>  unread <b>'+(s.unread||0)+'</b>  nextId <b>'+(s.nextId||1)+'</b>\nnode     <b>'+s.node+' ('+escapeHtml(s.nodeLetter||'')+')</b>  depth <b>'+s.depth+'</b>\ntext     <b>'+escapeHtml(s.text)+'</b>\npressed  <b>'+s.pressed+'</b>' +
+      (s.mode==='actions' ? '\nactions  <b>'+escapeHtml((s.actions||[]).join(' | '))+'</b> sel <b>'+s.actionSel+'</b>' : '') +
+      (s.mode==='message' ? '\nmsg      <b>#'+s.msgId+' '+(s.msgIdx+1)+'/'+s.unread+'</b> '+(s.msgMenu?'menu sel='+s.msgMenuSel:'tap=next hold=menu')+'\nmsgText  <b>'+escapeHtml(s.msgText||'')+'</b>' : '');
+    const ib = document.getElementById('inbox-' + dev);
+    ib.innerHTML = 'inbox    ' + ((s.inbox && s.inbox.length) ? s.inbox.map(m => '<b>#'+m.id+'</b> '+escapeHtml(m.text)).join('\n         ') : '<b>(empty)</b>');
+    const top = document.getElementById('unread-' + dev);
+    top.innerHTML = s.unread > 0 ? '<span class="badge">'+s.unread+' NEW</span>' : '<span class="badge zero">0 NEW</span>';
+    return s;
+  } catch(e) { return null; }
+}
+async function refreshRelay() {
+  try {
+    const r = await fetch('/api/relay', {cache:'no-store'});
+    const s = await r.json();
+    document.getElementById('rhost').value = s.host || '';
+    document.getElementById('rport').value = s.port || '';
+    const dot = document.getElementById('relayDot');
+    const ok = s.dad && s.emma && s.dad.link === 2 && s.emma.link === 2;
+    const half = s.dad && s.emma && (s.dad.link >= 1 || s.emma.link >= 1);
+    dot.innerHTML = '<span style="color:' + (ok ? '#46eb37' : (half ? '#ff9f0a' : '#ff5a4e')) + '">●</span>';
+    let st = '<b>' + escapeHtml(s.host) + ':' + s.port + '</b> dad:<b>' + escapeHtml(s.dad.linkName) + '</b>#' + s.dad.lastSeq + ' emma:<b>' + escapeHtml(s.emma.linkName) + '</b>#' + s.emma.lastSeq;
+    if (s.dad.error) st += ' <span class="err">dad: ' + escapeHtml(s.dad.error) + '</span>';
+    if (s.emma.error) st += ' <span class="err">emma: ' + escapeHtml(s.emma.error) + '</span>';
+    document.getElementById('rstatus').innerHTML = st;
+  } catch(e) {}
+}
+setInterval(() => { frame('dad'); }, 1000/20);
+setInterval(() => { frame('emma'); }, 1000/20);
+setInterval(() => { state('dad'); state('emma'); refreshRelay(); }, 800);
+frame('dad'); frame('emma'); state('dad'); state('emma'); refreshRelay();
 
-async function press(down) {
-  await fetch('/api/press', {method:'POST', body: down ? 'down' : 'up'});
-  document.getElementById('boot').classList.toggle('held', !!down);
+async function press(dev, down) {
+  await fetch('/api/' + dev + '/press', {method:'POST', body: down ? 'down' : 'up'});
+  const b = document.getElementById('boot-' + dev);
+  if (b) b.classList.toggle('held', !!down);
 }
-const boot = document.getElementById('boot');
-boot.addEventListener('pointerdown', e => { e.preventDefault(); boot.setPointerCapture(e.pointerId); press(true); });
-boot.addEventListener('pointerup', () => press(false));
-boot.addEventListener('pointercancel', () => press(false));
+for (const dev of DEVS) {
+  const boot = document.getElementById('boot-' + dev);
+  boot.addEventListener('pointerdown', e => { e.preventDefault(); try{boot.setPointerCapture(e.pointerId);}catch(_){} press(dev, true); });
+  boot.addEventListener('pointerup', () => press(dev, false));
+  boot.addEventListener('pointercancel', () => press(dev, false));
+}
+let focused = 'dad';
+for (const dev of DEVS) {
+  document.getElementById('boot-' + dev).addEventListener('focus', () => { focused = dev; });
+  document.getElementById('boot-' + dev).addEventListener('pointerdown', () => { focused = dev; });
+}
 window.addEventListener('keydown', e => {
-  if (e.code === 'Space' && !e.repeat) { e.preventDefault(); press(true); }
-  if (e.key === 'c' || e.key === 'C') { fetch('/api/clear', {method:'POST'}); }
-  if (e.key === 'r' || e.key === 'R') { receive(); }
+  if (e.code === 'Space' && !e.repeat && (document.activeElement === document.body || (document.activeElement && document.activeElement.id.startsWith('boot-')))) { e.preventDefault(); press(focused, true); }
+  if ((e.key === 'c' || e.key === 'C') && !e.repeat) { fetch('/api/dad/clear', {method:'POST'}); }
+  if ((e.key === 'r' || e.key === 'R') && !e.repeat) { receive('dad'); }
 });
-window.addEventListener('keyup', e => { if (e.code === 'Space') { e.preventDefault(); press(false); } });
-document.getElementById('tap').onclick = async () => {
-  await fetch('/api/press', {method:'POST', body:'down'});
-  setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 90);
-};
-document.getElementById('dash').onclick = async () => {
-  await fetch('/api/press', {method:'POST', body:'down'});
-  setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 320);
-};
-document.getElementById('holdmenu').onclick = async () => {
-  await fetch('/api/press', {method:'POST', body:'down'});
-  setTimeout(async () => { await fetch('/api/press', {method:'POST', body:'up'}); }, 1600);
-};
-document.getElementById('clear').onclick = () => fetch('/api/clear', {method:'POST'});
-async function receive() {
-  const t = document.getElementById('rxtext').value;
-  await fetch('/api/receive', {method:'POST', body: JSON.stringify({text:t})});
-  state();
+window.addEventListener('keyup', e => { if (e.code === 'Space') { e.preventDefault(); press(focused, false); } });
+document.querySelectorAll('button[data-act]').forEach(btn => {
+  btn.onclick = async () => {
+    const dev = btn.getAttribute('data-dev');
+    const act = btn.getAttribute('data-act');
+    if (act === 'tap') {
+      await fetch('/api/' + dev + '/press', {method:'POST', body:'down'});
+      setTimeout(async () => { await fetch('/api/' + dev + '/press', {method:'POST', body:'up'}); }, 90);
+    } else if (act === 'dash') {
+      await fetch('/api/' + dev + '/press', {method:'POST', body:'down'});
+      setTimeout(async () => { await fetch('/api/' + dev + '/press', {method:'POST', body:'up'}); }, 320);
+    } else if (act === 'holdmenu') {
+      await fetch('/api/' + dev + '/press', {method:'POST', body:'down'});
+      setTimeout(async () => { await fetch('/api/' + dev + '/press', {method:'POST', body:'up'}); }, 1600);
+    } else if (act === 'clear') {
+      fetch('/api/' + dev + '/clear', {method:'POST'});
+    } else if (act === 'wifi') {
+      const s = await (await fetch('/api/' + dev + '/state')).json();
+      fetch('/api/' + dev + '/wifi', {method:'POST', body: JSON.stringify({on: !s.wifi})});
+    }
+  };
+});
+async function receive(dev) {
+  const t = document.getElementById('rx-' + dev).value;
+  await fetch('/api/' + dev + '/receive', {method:'POST', body: JSON.stringify({text:t})});
+  state(dev);
 }
-document.getElementById('receive').onclick = receive;
-document.getElementById('shot').onclick = async () => {
-  const r = await fetch('/api/frame.bmp', {cache:'no-store'});
-  const b = await r.blob();
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(b);
-  a.download = 'morse-sim.bmp';
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-};
+document.getElementById('recv-dad').onclick = () => receive('dad');
+document.getElementById('recv-emma').onclick = () => receive('emma');
+async function sendVia(dev) {
+  const t = document.getElementById('send-' + dev).value;
+  const r = await fetch('/api/' + dev + '/send', {method:'POST', body: JSON.stringify({text:t})});
+  if (!r.ok) alert('send failed: ' + await r.text());
+  state(dev);
+}
+document.getElementById('sendbtn-dad').onclick = () => sendVia('dad');
+document.getElementById('sendbtn-emma').onclick = () => sendVia('emma');
+for (const dev of DEVS) {
+  document.getElementById('shot-' + dev).onclick = async () => {
+    const r = await fetch('/api/' + dev + '/frame.bmp', {cache:'no-store'});
+    const b = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = 'morse-' + dev + '.bmp';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  };
+  document.getElementById('settext-' + dev).onclick = () => {
+    const t = document.getElementById('text-' + dev).value;
+    fetch('/api/' + dev + '/text', {method:'POST', body: JSON.stringify({text:t})});
+  };
+}
 const scenes = ['root','e-selected','hello','sos-help','mid-letter-s','wrapped','hold-dash','hold-menu','menu','badge','message','message-menu'];
-const box = document.getElementById('scenes');
-for (const s of scenes) {
-  const btn = document.createElement('button');
-  btn.textContent = s;
-  btn.onclick = () => fetch('/api/scene', {method:'POST', body: JSON.stringify({scene:s})});
-  box.appendChild(btn);
+for (const dev of DEVS) {
+  const box = document.getElementById('scenes-' + dev);
+  const lbl = document.createElement('span');
+  lbl.textContent = dev + ': ';
+  box.appendChild(lbl);
+  for (const s of scenes) {
+    const btn = document.createElement('button');
+    btn.textContent = s;
+    btn.onclick = () => fetch('/api/' + dev + '/scene', {method:'POST', body: JSON.stringify({scene:s})});
+    box.appendChild(btn);
+  }
 }
-document.getElementById('settext').onclick = () => {
-  const t = document.getElementById('text').value;
-  fetch('/api/text', {method:'POST', body: JSON.stringify({text:t})});
+document.getElementById('rsave').onclick = async () => {
+  const body = JSON.stringify({
+    host: document.getElementById('rhost').value.trim(),
+    port: parseInt(document.getElementById('rport').value.trim(), 10) || 8180,
+    dadToken: document.getElementById('rdad').value.trim(),
+    emmaToken: document.getElementById('remma').value.trim(),
+    enabled: true
+  });
+  const r = await fetch('/api/relay', {method:'POST', body});
+  if (!r.ok) alert('relay save failed: ' + await r.text());
+  document.getElementById('rdad').value = '';
+  document.getElementById('remma').value = '';
+  refreshRelay();
 };
 </script>
 </body>

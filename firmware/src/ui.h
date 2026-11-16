@@ -35,6 +35,18 @@ enum MorsePreview : uint8_t {
   PREVIEW_ACTIONS = 4  // long hold armed: release opens the action menu
 };
 
+// Link status for the top-left dot (see uiSetLink):
+//   LINK_OFF  = red    — no WiFi connection
+//   LINK_WIFI = orange — WiFi OK, but no connection to the relay server
+//   LINK_OK   = green  — both WiFi and relay are OK
+enum UiLink : uint8_t {
+  LINK_OFF  = 0,
+  LINK_WIFI = 1,
+  LINK_OK   = 2
+};
+
+void uiSetLink(uint8_t link);
+
 // One incoming message. The display owns a small ring; a message that has
 // been read is removed, so `unread == stored count`. `id` is unique and
 // monotonically increasing (per boot in the sim; persisted NVS `last_seq`
@@ -47,6 +59,12 @@ struct InboxMsg {
 class Adafruit_ST7789;
 
 void uiBegin(Adafruit_ST7789* display);
+
+// Switch the render target without clearing the shared canvas. The sim hosts
+// two virtual devices (dad + emma) in one process; it calls uiAttach() before
+// drawing a device so partial updates repaint their own rect. uiBegin() is
+// still the one-time init.
+void uiAttach(Adafruit_ST7789* display);
 
 // Complete repaint (title, tree, divider, pattern, text, countdown).
 void uiFull(const MorseState& st, uint32_t now);

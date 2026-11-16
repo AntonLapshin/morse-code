@@ -33,6 +33,11 @@ The board has two physical buttons: **BOOT** (GPIO0) and **RESET/EN**.
 | Press **RESET/EN** | clear all decoded text (the board reboots) |
 | Serial `MSG <text>` | simulate an incoming message (unique `#id`, `N NEW` badge top-right) |
 
+The **top-left dot** is the link indicator on every screen: red = no WiFi
+connection, orange = WiFi OK but no connection to the relay, green = both OK.
+(The firmware has no network task yet, so a freshly flashed board shows red;
+the sim shows live orange/green against the real relay.)
+
 **About the RESET/EN button.** On the IdeaSpark board the button labelled
 `RESET` (the left-hand button) is wired to the ESP32 `EN` pin, not a normal
 GPIO. It cannot be read by software, so pressing it reboots the ESP32 — which
@@ -157,13 +162,18 @@ montages them with ImageMagick. The preview uses the *real* tree table and
 renderer, so a coordinate fix there is a coordinate fix on the device.
 Requirements: a C++17 compiler and ImageMagick (`magick`).
 
-## Display simulator (live web UI)
+## Display simulator (live web UI, 2 devices + real relay)
 
-`tools/sim/` is an ESP32-device simulation with the display: it links the
-*real* `ui.cpp` + `morse.cpp` against host shims and serves a pixel-exact
-`170×320` panel in the browser, calling the same API the firmware uses
-(`uiBegin / uiFull / uiPattern / uiResult / uiProgress`) with the same input
-state machine as `main.cpp`.
+`tools/sim/` is a two-ESP32-device simulation with the display: it links the
+*real* `ui.cpp` + `morse.cpp` against host shims and serves two pixel-exact
+`170×320` panels (Dad + Emma) in the browser, calling the same API the
+firmware uses (`uiBegin / uiAttach / uiFull / uiPattern / uiResult /
+uiProgress`) with the same input state machine as `main.cpp`.
+
+Each virtual device runs its own relay poller against the **real** relay
+server, so a Morse `SEND` on Dad's panel appears on Emma's panel. The
+**top-left dot** shows the link state on every screen: red = no WiFi, orange
+= WiFi OK but no relay connection, green = both OK.
 
 ```bash
 make sim                 # http://localhost:8077/ (PORT_SIM=8080 to change)
@@ -171,16 +181,26 @@ make sim-dump            # headless screenshots -> tools/sim/out/*.ppm
 ./scripts/sim.sh 8077
 ```
 
-The web UI shows the live framebuffer on a `pixelated` canvas, a virtual BOOT
-button (pointer + `Space` key; tap = dot, hold = dash, hold 1.5 s = action
-menu), a **receive message** button (`R`) that queues an incoming message with
-a unique `#id` and lights the `N NEW` badge, the twelve preview scenes, a text
-setter, and a BMP screenshot button. The inbox is newest-first; opening a
-message and moving on (`TAP`/ `NEXT`) or leaving it (`CLOSE`) removes it, so
-the badge always counts what is left. Endpoints: `GET /api/state`,
-`GET /api/frame.raw`, `GET /api/frame.bmp`, `POST /api/press` (`down`/`up`),
-`POST /api/scene`, `POST /api/text`, `POST /api/receive` (`{"text":"..."}`),
-`GET /api/messages`, `POST /api/clear`.
+Tokens come from the environment (`MORSE_TOKEN_DAD` / `MORSE_TOKEN_EMMA`) or
+the repo-root `.env`, `--dad-token` / `--emma-token` / `--relay=host:port`
+flags, or the relay bar in the page (`POST /api/relay`). If both dots stay
+orange with `auth rejected (401)`, the sim's tokens do not match the relay
+machine's `.env` — paste the relay's tokens into the relay bar and press save.
+
+The web UI shows both framebuffers on `pixelated` canvases, a virtual BOOT
+button per device (pointer + `Space` key on the focused device; tap = dot,
+hold = dash, hold 1.5 s = action menu), a **send via relay** box (`⇧`) that
+POSTs through the real server, a **receive (local)** button (`R`) that queues
+an incoming message with a unique `#id` and lights the `N NEW` badge, the
+twelve preview scenes, a text setter, and a BMP screenshot button. The inbox
+is newest-first; opening a message and moving on (`TAP`/ `NEXT`) or leaving
+it (`CLOSE`) removes it, so the badge always counts what is left. Per-device
+endpoints live under `/api/dad/*` and `/api/emma/*` (legacy `/api/*` maps to
+dad): `GET state`, `GET frame.raw`, `GET frame.bmp`, `POST press`
+(`down`/`up`), `POST scene`, `POST text`, `POST receive` (`{"text":"..."}`),
+`POST send` (`{"text":"..."}` → relay), `POST wifi` (`{"on":true}`), `GET
+messages`, `POST clear`; `GET /api/relay` shows link state and `POST
+/api/relay` reconfigures host/port/tokens at runtime.
 
 ## Timing and configuration
 

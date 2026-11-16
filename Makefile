@@ -87,7 +87,7 @@ sim:
 
 sim-dump:
 	@mkdir -p tools/sim/build tools/sim/out
-	c++ -std=c++17 -O2 -Wall -Wextra -Itools/preview -Ifirmware/src \
+	c++ -std=c++17 -O2 -Wall -Wextra -pthread -Itools/preview -Ifirmware/src \
 	  tools/sim/sim.cpp firmware/src/ui.cpp firmware/src/morse.cpp \
 	  -o tools/sim/build/sim
 	./tools/sim/build/sim --dump tools/sim/out

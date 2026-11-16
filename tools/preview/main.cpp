@@ -101,6 +101,7 @@ int main(int argc, char** argv) {
   display.init(SCREEN_W, SCREEN_H);
   display.setRotation(DISPLAY_ROTATION);
   uiBegin(&display);
+  uiSetLink(LINK_OK); // preview assumes an online device (green dot)
 
   const uint32_t now = 10000;
 

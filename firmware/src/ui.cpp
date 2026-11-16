@@ -32,6 +32,7 @@ static const uint16_t COL_RED_DEEP   = C(72, 12, 10);
 static const uint16_t COL_RED_DARK   = C(30, 6, 6);
 static const uint16_t COL_YELLOW     = C(255, 214, 96);
 static const uint16_t COL_YELLOW_DIM = C(120, 94, 32);
+static const uint16_t COL_ORANGE     = C(255, 159, 10);
 static const uint16_t COL_WHITE      = 0xFFFF;
 static const uint16_t COL_CARD       = C(14, 22, 40);
 static const uint16_t COL_CARD_EDGE  = C(60, 80, 110);
@@ -52,6 +53,23 @@ static const uint16_t COL_CARD_EDGE  = C(60, 80, 110);
 static Adafruit_ST7789* tft = nullptr;
 static GFXcanvas16*     canvas = nullptr;
 static Adafruit_GFX*    gfx = nullptr;
+
+// Link status for the top-left dot. The network task owns this value;
+// the renderer only reads it. Defaults to red (no WiFi) until WiFi + the
+// relay report otherwise.
+static uint8_t s_link = LINK_OFF;
+
+void uiSetLink(uint8_t link) {
+  s_link = (link <= LINK_OK) ? link : (uint8_t)LINK_OFF;
+}
+
+static void drawLinkDot() {
+  if (!gfx) return;
+  uint16_t c = COL_RED;
+  if (s_link == LINK_WIFI) c = COL_ORANGE;
+  else if (s_link == LINK_OK) c = COL_GREEN;
+  gfx->fillCircle(10, 7, 4, c);
+}
 
 // -----------------------------------------------------------------------------
 // Text helpers
@@ -472,12 +490,19 @@ void uiBegin(Adafruit_ST7789* display) {
   gfx->fillScreen(COL_BG);
 }
 
+void uiAttach(Adafruit_ST7789* display) {
+  // Switch output only; the shared canvas keeps its pixels so the next
+  // partial update can repaint just its own rect.
+  tft = display;
+}
+
 void uiFull(const MorseState& st, uint32_t now) {
   if (!gfx) return;
   gfx->fillScreen(COL_BG);
   gfx->setTextWrap(false);
 
   centeredText("MORSE CODE", TITLE_Y, 2, COL_TITLE, COL_BG, 1);
+  drawLinkDot();
   drawTree(st, now);
 
   drawPattern(st, PREVIEW_NONE, now);
@@ -508,6 +533,7 @@ void uiBadge(uint8_t unread, uint32_t now) {
   (void)now;
   if (!gfx) return;
   gfx->fillRect(0, 0, SCREEN_W, 14, COL_BG);
+  drawLinkDot();
   if (unread == 0) {
     flushRect(0, 14);
     return;
@@ -543,9 +569,10 @@ void uiMessageCard(uint32_t id, const char* text, uint8_t index1, uint8_t total,
   gfx->fillScreen(COL_BG);
   gfx->setTextWrap(false);
 
+  drawLinkDot();
   char left[20];
   snprintf(left, sizeof(left), "MSG #%u", (unsigned)id);
-  drawText(left, 8, 6, 1, COL_TITLE, COL_BG);
+  drawText(left, 18, 6, 1, COL_TITLE, COL_BG);
   char right[16];
   if (total > 0)
     snprintf(right, sizeof(right), "%u/%u", index1, total);

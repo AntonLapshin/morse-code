@@ -4,12 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PORT="${1:-8077}"
+if [[ $# -ge 1 ]]; then shift; fi
 BUILD=tools/sim/build
 mkdir -p "$BUILD"
 echo "Compiling sim ..."
-c++ -std=c++17 -O2 -Wall -Wextra \
+c++ -std=c++17 -O2 -Wall -Wextra -pthread \
   -Itools/preview -Ifirmware/src \
   tools/sim/sim.cpp firmware/src/ui.cpp firmware/src/morse.cpp \
   -o "$BUILD/sim"
 echo "Serving at http://localhost:$PORT/ ..."
-exec "$BUILD/sim" --port "$PORT" --index tools/sim/index.html
+exec "$BUILD/sim" --port "$PORT" --index tools/sim/index.html "$@"
