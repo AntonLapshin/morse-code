@@ -1,0 +1,27 @@
+# build output / host preview artefacts
+build/
+.pio/
+.vscode/
+tools/preview/build/
+tools/preview/out/
+*.bin
+*.elf
+*.map
+*.o
+
+# secrets: only .env.example is committed
+.env
+.env.*
+!.env.example
+firmware/src/secrets.h
+server/data/
+
+# uv virtualenv / caches
+server/.venv/
+.uv-cache/
+__pycache__/
+.pytest_cache/
+
+# editor / OS noise
+.DS_Store
+*~
