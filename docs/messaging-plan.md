@@ -76,7 +76,7 @@ y=276  decoded result / hints
 ### 3.2 Network
 
 - Laptop: Omarchy (Arch-based), hostname `omarchy`, reserved address
-  `192.178.4.44` on `wlp130s0f0` (DHCP reservation).
+  `192.168.4.44` on `wlo1` (DHCP reservation).
 - The ESP32s and the laptop are on the same home WiFi (2.4 GHz; ESP32 cannot see
   5 GHz-only SSIDs). This plan assumes both boards are on that LAN; see the note
   in §1.
@@ -134,7 +134,7 @@ later.
                      │ HTTP POST / long-poll
         ┌────────────▼─────────────┐
         │ Omarchy laptop           │
-        │  FastAPI relay :8080     │
+        │  FastAPI relay :8180     │
         │  SQLite message store    │
         │  auth + presence + ack   │
         └────────────┬─────────────┘
@@ -503,7 +503,7 @@ repo-root `.env` is gitignored and holds every secret.**
 ```toml
 [server]
 host = "0.0.0.0"
-port = 8080
+port = 8180
 db = "data/morse.db"
 family_name = "MORSE"
 retention = 1000
@@ -530,8 +530,8 @@ peer = true
 WIFI_SSID="home-2.4"
 WIFI_PASS="..."
 
-RELAY_HOST="192.178.4.44"
-RELAY_PORT="8080"
+RELAY_HOST="192.168.4.44"
+RELAY_PORT="8180"
 
 MORSE_TOKEN_DAD="<openssl rand -hex 24>"
 MORSE_TOKEN_EMMA="<openssl rand -hex 24>"
@@ -557,7 +557,7 @@ MORSE_TOKEN_EMMA="<openssl rand -hex 24>"
 - `.env` holds WiFi credentials and tokens; it is `chmod 600`, gitignored, and
   never logged. Tokens are not stored in SQLite either.
 - Bind to the LAN; do **not** port-forward. If the laptop has a public
-  interface, bind to the LAN IP instead of `0.0.0.0`, or firewall port 8080.
+  interface, bind to the LAN IP instead of `0.0.0.0`, or firewall port 8180.
 - No TLS in the MVP: the token and message text are visible on the local WiFi.
   Acceptable for a trusted WPA2/3 home network; document it. If the network is
   shared, add HTTPS or Tailscale later.
@@ -592,7 +592,7 @@ cd ~/ws/morse-code
 $EDITOR .env                # WiFi credentials + RELAY_HOST
 cd server
 uv sync
-uv run uvicorn app:app --host 0.0.0.0 --port 8080
+uv run uvicorn app:app --host 0.0.0.0 --port 8180
 ```
 
 The server reads the repo-root `.env` by absolute path, so the systemd unit
@@ -608,7 +608,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=%h/ws/morse-code/server
-ExecStart=%h/ws/morse-code/server/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --log-level info
+ExecStart=%h/ws/morse-code/server/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8180 --log-level info
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
@@ -629,11 +629,11 @@ journalctl --user -u morse-relay -f
 
 Open the firewall for the LAN only (example for `ufw`; adapt if Omarchy uses
 `firewalld`/nftables directly). Find the subnet with
-`ip -o -f inet addr show wlp130s0f0`, then allow only that CIDR (the example
-assumes `192.178.4.0/24`; adjust):
+`ip -o -f inet addr show wlo1`, then allow only that CIDR (the example
+assumes `192.168.4.0/22`; adjust):
 
 ```bash
-sudo ufw allow from 192.178.4.0/24 to any port 8080 proto tcp
+sudo ufw allow from 192.168.4.0/22 to any port 8180 proto tcp
 ```
 
 Keep the laptop awake with the lid closed if it is the dedicated relay. A
@@ -653,15 +653,15 @@ too broad.
 ### 6.9 Operations
 
 - **Stable address:** the laptop's WiFi MAC has a DHCP reservation for
-  `192.178.4.44`. If it ever changes, update `RELAY_HOST` in `.env` and
+  `192.168.4.44`. If it ever changes, update `RELAY_HOST` in `.env` and
   regenerate `secrets.h` on both ESP32s.
-- **Health check:** `curl http://192.178.4.44:8080/health`.
+- **Health check:** `curl http://192.168.4.44:8180/health`.
 - **Logs:** `journalctl --user -u morse-relay -f`; message sends are logged as
   `tx dad -> family: HELLO`.
 - **Backups:** nightly `sqlite3 ... ".backup"` to a local folder.
 - **Time:** the laptop is NTP-synced; server timestamps are authoritative.
 - **WiFi power saving:** if latency is poor, test with
-  `iw dev wlp130s0f0 set power_save off` (temporary) before changing
+  `iw dev wlo1 set power_save off` (temporary) before changing
   NetworkManager config.
 
 ---
@@ -1171,8 +1171,8 @@ Single source of truth: the repo-root `.env` (gitignored, `chmod 600`).
 WIFI_SSID="home-2.4"
 WIFI_PASS="..."
 
-RELAY_HOST="192.178.4.44"
-RELAY_PORT="8080"
+RELAY_HOST="192.168.4.44"
+RELAY_PORT="8180"
 
 MORSE_TOKEN_DAD="<openssl rand -hex 24>"
 MORSE_TOKEN_EMMA="<openssl rand -hex 24>"
@@ -1189,8 +1189,8 @@ tokens, then edit the WiFi credentials.
 
 #define WIFI_SSID    "home-2.4"
 #define WIFI_PASS    "..."
-#define SERVER_HOST  "192.178.4.44"
-#define SERVER_PORT  8080
+#define SERVER_HOST  "192.168.4.44"
+#define SERVER_PORT  8180
 #define DEVICE_ID    "dad"
 #define DEVICE_NAME  "DAD"          // logs; the server name wins on screen
 #define DEVICE_TOKEN "<generated>"
@@ -1423,7 +1423,7 @@ Resolved on 2026-11-16:
    sends. The old 1.5 s hold-to-clear is removed — `CLEAR` lives only inside
    ACTIONS, so it cannot fire while typing.
 4. **LAN-only first milestone.** The phone/watch bridge remains Phase 4.
-5. **Relay address.** The laptop keeps `192.178.4.44` via a DHCP reservation.
+5. **Relay address.** The laptop keeps `192.168.4.44` via a DHCP reservation.
 
 Still open:
 

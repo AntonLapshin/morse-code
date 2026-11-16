@@ -13,7 +13,7 @@ TOKENS = {"dad": "d" * 24, "emma": "e" * 24}
 BASE_CONFIG = """
 [server]
 host = "127.0.0.1"
-port = 8080
+port = 8180
 db = "data/morse.db"
 retention = 1000
 

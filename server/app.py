@@ -2,7 +2,7 @@
 
 Run a single uvicorn worker: long-poll waiters live in this process.
 
-    uv run uvicorn app:app --host 0.0.0.0 --port 8080
+    uv run uvicorn app:app --host 0.0.0.0 --port 8180
 """
 
 from __future__ import annotations

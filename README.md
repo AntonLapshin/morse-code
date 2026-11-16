@@ -57,7 +57,7 @@ Phase 1 adds WiFi and an outbox.
 $EDITOR .env            # set WIFI_SSID + WIFI_PASS, check RELAY_HOST
 cd server
 uv sync
-uv run uvicorn app:app --host 0.0.0.0 --port 8080
+uv run uvicorn app:app --host 0.0.0.0 --port 8180
 ```
 
 Run one worker only. Secrets live in `.env` (gitignored); see

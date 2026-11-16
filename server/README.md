@@ -32,16 +32,16 @@ Bind to the LAN so the ESP32s can reach it. Do **not** port-forward.
 
 ```bash
 cd server
-uv run uvicorn app:app --host 0.0.0.0 --port 8080
+uv run uvicorn app:app --host 0.0.0.0 --port 8180
 ```
 
 Use exactly **one** worker: long-poll waiters are in-process state. Check it:
 
-The laptop keeps the reserved address `192.178.4.44` (DHCP reservation).
+The laptop keeps the reserved address `192.168.4.44` (DHCP reservation).
 Check the relay from the LAN with:
 
 ```bash
-curl -s http://192.178.4.44:8080/health | jq
+curl -s http://192.168.4.44:8180/health | jq
 ```
 
 On the laptop itself, clone the repo, create `.env` (see Setup above), and
@@ -78,24 +78,24 @@ All `/api/v1/*` calls need `Authorization: Bearer <device token>`.
 TOKEN=...   # MORSE_TOKEN_DAD or MORSE_TOKEN_EMMA from .env
 
 # Send
-curl -s -X POST http://127.0.0.1:8080/api/v1/messages \
+curl -s -X POST http://127.0.0.1:8180/api/v1/messages \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"client_msg_id":"dad-1-1","text":"HELLO"}'
 
 # Long-poll (since = last seq processed, wait <= 25 s)
-curl -s -G http://127.0.0.1:8080/api/v1/messages \
+curl -s -G http://127.0.0.1:8180/api/v1/messages \
   -H "Authorization: Bearer $TOKEN" \
   --data-urlencode since=0 --data-urlencode wait=20
 
 # Ack displayed messages
-curl -s -X POST http://127.0.0.1:8080/api/v1/ack \
+curl -s -X POST http://127.0.0.1:8180/api/v1/ack \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"upto_seq":1}'
 
 # Device presence / unread / latest seq
-curl -s http://127.0.0.1:8080/api/v1/state \
+curl -s http://127.0.0.1:8180/api/v1/state \
   -H "Authorization: Bearer $TOKEN"
 ```
 

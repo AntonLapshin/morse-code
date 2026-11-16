@@ -7,7 +7,7 @@
 
 [server]
 host = "0.0.0.0"          # bind to the LAN; do not port-forward this port
-port = 8080
+port = 8180
 db = "data/morse.db"      # relative to this file
 family_name = "MORSE"
 retention = 1000          # keep the newest N messages

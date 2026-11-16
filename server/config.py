@@ -67,7 +67,7 @@ class Device:
 @dataclass(frozen=True)
 class ServerSettings:
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8180
     db: str = "data/morse.db"
     family_name: str = "MORSE"
     retention: int = 1000
@@ -157,7 +157,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         raise ConfigError("[server] must be a table")
 
     try:
-        port = int(os.environ.get("MORSE_PORT", server_raw.get("port", 8080)))
+        port = int(os.environ.get("MORSE_PORT", server_raw.get("port", 8180)))
         retention = int(server_raw.get("retention", 1000))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"port/retention must be integers: {exc}") from exc
