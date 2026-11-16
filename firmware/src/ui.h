@@ -45,6 +45,13 @@ enum UiLink : uint8_t {
   LINK_OK   = 2
 };
 
+enum ToastKind : uint8_t {
+  TOAST_OK   = 0, // SENT (green)
+  TOAST_WARN = 1, // QUEUED (yellow)
+  TOAST_ERR  = 2, // offline / rejected (red)
+  TOAST_INFO = 3  // neutral (white)
+};
+
 void uiSetLink(uint8_t link);
 
 // One incoming message. The display owns a small ring; a message that has
@@ -77,6 +84,7 @@ void uiProgress(const MorseState& st, bool pressed, uint32_t now);
 // Incoming-message UI. All overlays compose in RAM first, so there is no
 // black flash when a menu opens.
 void uiBadge(uint8_t unread, uint32_t now); // "N NEW" at the top-right
+void uiToast(const char* msg, uint8_t kind, uint32_t now); // transient overlay
 void uiActionSheet(const char* const* items, uint8_t count, uint8_t selected,
                    uint32_t now); // COMPOSE long-hold menu (SEND/CLEAR/READ/...)
 void uiMessageCard(uint32_t id, const char* text, uint8_t index1, uint8_t total,

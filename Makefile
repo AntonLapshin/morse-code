@@ -1,8 +1,9 @@
 # morse-code — ESP32 build + flash shortcuts (IdeaSpark, CH340, ST7789)
 #
-#   make upload              compile + flash to the auto-detected port
+#   make upload [DEVICE=dad|emma]  regen secrets.h, compile + flash auto-detected port
 #   make upload PORT=/dev/ttyUSB0
-#   make build               compile-check only (no device needed)
+#   make upload-dad / make upload-emma   shortcuts (DEVICE fixed)
+#   make build [DEVICE=dad|emma]   compile-check only (no device needed)
 #   make monitor             serial log @ 115200 (Ctrl+C to exit)
 #   make check               verify toolchain + serial port
 #   make secrets DEVICE=dad  generate firmware/src/secrets.h from .env
@@ -25,15 +26,19 @@ BUILD_DIR := /tmp/morse-code-sketch/build
 BAUD      := 115200
 
 SOURCES := firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
-           firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h
+           firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h \
+           firmware/src/net.cpp firmware/src/net.h
 
-.PHONY: help build upload monitor check preview sim sim-dump clean stage secrets \
+.PHONY: help build upload upload-dad upload-emma monitor check preview sim sim-dump clean stage secrets \
         start stop restart status
 
 help:
 	@echo "Targets:"
-	@echo "  make upload [PORT=/dev/ttyUSB0]  compile + flash firmware to ESP32"
-	@echo "  make build                       compile-check only (no device needed)"
+	@echo "  make upload [DEVICE=dad|emma] [PORT=/dev/ttyUSB0]  regen secrets.h, compile + flash"
+	@echo "  make upload-dad [PORT=...]     shortcut for DEVICE=dad"
+	@echo "  make upload-emma [PORT=...]    shortcut for DEVICE=emma"
+	@echo "  make build [DEVICE=dad|emma]   compile-check only (no device needed)"
+	@echo "  make secrets DEVICE=dad       generate firmware/src/secrets.h from .env"
 	@echo "  make monitor [PORT=...]          serial log @ 115200 baud"
 	@echo "  make check                       verify arduino-cli core/libs + serial port"
 	@echo "  make secrets DEVICE=dad          generate firmware/src/secrets.h from .env"
@@ -62,28 +67,39 @@ check:
 	@ls -l $(PORT) || (echo "No serial port at $(PORT). Plug in via USB data cable, then: ls /dev/ttyUSB* /dev/ttyACM*"; exit 1)
 
 # Stage the sources into a sketch folder (same layout as build-arduino-cli.sh).
-$(SKETCH)/main.cpp: $(SOURCES)
+# Always restages (phony): `make upload DEVICE=emma` regenerates secrets.h
+# first, and the staged copy must follow even when the .cpp files are untouched.
+stage:
 	@rm -rf /tmp/morse-code-sketch
 	@mkdir -p $(SKETCH)
 	@cp firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
-	    firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h $(SKETCH)/
+	    firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h \
+	    firmware/src/net.cpp firmware/src/net.h $(SKETCH)/
 	@if [ -f firmware/src/secrets.h ]; then cp firmware/src/secrets.h $(SKETCH)/; fi
 	@printf '// morse-code sketch - real sources live in main.cpp / ui.cpp / morse.cpp\n' \
 	    > $(SKETCH)/morse-code.ino
 
-stage: $(SKETCH)/main.cpp
-
-build: stage
+build: secrets stage
+	@if [ ! -f firmware/src/secrets.h ]; then \
+	  echo "firmware/src/secrets.h missing. Run: make secrets DEVICE=$(DEVICE)"; \
+	  exit 1; \
+	fi
 	arduino-cli compile --fqbn $(FQBN) --output-dir $(BUILD_DIR) $(SKETCH)
 
-upload: stage
+upload: secrets stage
 	@if [ ! -e "$(PORT)" ]; then \
 	  echo "No serial port at $(PORT). Plug in via USB data cable, then: ls /dev/ttyUSB* /dev/ttyACM*"; \
 	  exit 1; \
 	fi
 	arduino-cli compile --fqbn $(FQBN) --output-dir $(BUILD_DIR) $(SKETCH)
 	arduino-cli upload -p $(PORT) --fqbn $(FQBN) --input-dir $(BUILD_DIR) $(SKETCH)
-	@echo "Flashed $(PORT). Run 'make monitor PORT=$(PORT)' to verify the boot log."
+	@echo "Flashed $(PORT) as $(DEVICE). Run 'make monitor PORT=$(PORT)' to verify the boot log."
+
+upload-dad:
+	@$(MAKE) --no-print-directory upload DEVICE=dad PORT=$(PORT)
+
+upload-emma:
+	@$(MAKE) --no-print-directory upload DEVICE=emma PORT=$(PORT)
 
 monitor:
 	arduino-cli monitor -p $(PORT) -c baudrate=$(BAUD)

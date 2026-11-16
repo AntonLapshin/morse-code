@@ -4,7 +4,8 @@
 #   ./build-arduino-cli.sh                      # compile only
 #   ./build-arduino-cli.sh --upload             # compile + flash auto-detected port
 #   ./build-arduino-cli.sh --upload /dev/ttyUSB0
-#   ./build-arduino-cli.sh --device dad         # regenerate secrets.h from ../.env
+#   ./build-arduino-cli.sh --device dad          # regenerate secrets.h from ../.env
+#   ./build-arduino-cli.sh --device emma --upload # flash emma in one step
 #
 # Adafruit_ST7789 + Adafruit_GFX only; no library config flags required.
 set -euo pipefail
@@ -69,7 +70,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 rm -rf /tmp/morse-code-sketch
 mkdir -p "$SKETCH"
-cp src/main.cpp src/ui.cpp src/ui.h src/morse.cpp src/morse.h src/config.h "$SKETCH/"
+cp src/main.cpp src/ui.cpp src/ui.h src/morse.cpp src/morse.h src/config.h \
+   src/net.cpp src/net.h "$SKETCH/"
 if [[ -f src/secrets.h ]]; then cp src/secrets.h "$SKETCH/"; fi
 printf '// morse-code sketch - real sources live in main.cpp / ui.cpp / morse.cpp\n' \
   > "$SKETCH/morse-code.ino"

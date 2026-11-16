@@ -547,6 +547,36 @@ void uiBadge(uint8_t unread, uint32_t now) {
   flushRect(0, 14);
 }
 
+void uiToast(const char* msg, uint8_t kind, uint32_t now) {
+  (void)now;
+  if (!gfx || !msg || !*msg) return;
+  uint16_t border = COL_WHITE;
+  uint16_t fg = COL_WHITE;
+  if (kind == TOAST_OK) {
+    border = COL_GREEN;
+    fg = COL_GREEN_IN;
+  } else if (kind == TOAST_WARN) {
+    border = COL_YELLOW;
+    fg = COL_YELLOW;
+  } else if (kind == TOAST_ERR) {
+    border = COL_RED;
+    fg = COL_RED;
+  }
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%s", msg);
+  int w = textAdvance(buf, 1, 0);
+  int boxW = w + 20;
+  if (boxW > SCREEN_W - 16) boxW = SCREEN_W - 16;
+  if (boxW < 60) boxW = 60;
+  const int boxH = 22;
+  const int x = (SCREEN_W - boxW) / 2;
+  const int y = 218; // above the pattern row, over the tree
+  gfx->fillRect(x, y, boxW, boxH, COL_CARD);
+  gfx->drawRect(x, y, boxW, boxH, border);
+  centeredText(buf, y + 7, 1, fg, COL_CARD);
+  flushRect(y, boxH);
+}
+
 void uiActionSheet(const char* const* items, uint8_t count, uint8_t selected,
                    uint32_t now) {
   (void)now;

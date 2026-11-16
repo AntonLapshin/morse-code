@@ -1248,15 +1248,15 @@ it; `/health` is green.
 
 ### Phase 1 — Send-only firmware (1 day)
 
-- [ ] WiFi connect/reconnect in `net.cpp`; status shown in the top strip.
-- [ ] Outbox queue + `netTxTask` + POST.
-- [ ] Action sheet with `SEND`/`CLEAR`/`CLOSE`.
-- [ ] Toast feedback (`SENT`, `QUEUED`, `OFFLINE`).
-- [ ] Server logs the message; web UI optional.
-- [ ] Update the README **Controls** and troubleshooting sections for the new
+- [x] WiFi connect/reconnect in `net.cpp`; status shown in the top strip.
+- [x] Outbox queue + `netTxTask` + POST.
+- [x] Action sheet with `SEND`/`CLEAR`/`CLOSE`.
+- [x] Toast feedback (`SENT`, `QUEUED`, error toasts; offline = red dot + `QUEUED`).
+- [x] Server logs the message; web UI optional.
+- [x] Update the README **Controls** and troubleshooting sections for the new
       `HOLD → action sheet` gesture (the old 1.5 s hold-to-clear is gone).
-- [ ] Update `Makefile`, `platformio.ini`, `build-arduino-cli.sh` for the new
-      files and ArduinoJson.
+- [x] Update `Makefile`, `platformio.ini`, `build-arduino-cli.sh` for the new
+      files (no extra libs: hand-rolled JSON like the sim, no ArduinoJson).
 
 **Acceptance:** Type `HELLO`, long-press → `SEND` → long-press; the server log
 and web UI show it; the compose buffer clears; no Morse input is disturbed.

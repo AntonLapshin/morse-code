@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include "morse.h"
+#include "net.h"
 #include "ui.h"
 
 // IdeaSpark 1.9" ST7789 (fixed on-board wiring).
@@ -262,6 +263,32 @@ static void redrawMessage(uint32_t now) {
                 inboxCount, msgMenuOpen, msgMenuSel, now);
 }
 
+// --- Toast overlay (Phase 1 transient status) --------------------------------
+static char     toastMsg[24] = {0};
+static uint8_t  toastKind = TOAST_INFO;
+static uint32_t toastUntil = 0;
+static bool     toastActive = false;
+static uint8_t  lastLink = 0xFF;
+
+static void repaintCurrent(uint32_t now) {
+  if (appMode == MODE_ACTIONS) redrawActions(now);
+  else if (appMode == MODE_MESSAGE) redrawMessage(now);
+  else {
+    uiFull(st, now);
+    uiBadge(inboxCount, now);
+  }
+}
+
+static void showToast(const char* msg, uint8_t kind, uint32_t now,
+                      uint32_t durMs) {
+  if (!msg || !*msg) return;
+  snprintf(toastMsg, sizeof(toastMsg), "%s", msg);
+  toastKind = kind;
+  toastUntil = now + durMs;
+  toastActive = true;
+  uiToast(toastMsg, toastKind, now);
+}
+
 // Remove inbox[idx]; newest-first so deleting the viewed message reveals the
 // next older one at the same index.
 static void inboxRemoveAt(uint8_t idx) {
@@ -322,13 +349,33 @@ static void messageClose(uint32_t now) {
 static void activateAction(uint32_t now) {
   const char* sel = actionSel < actionCount ? actionPtrs[actionSel] : "CLOSE";
   if (!strncmp(sel, "SEND", 4)) {
-    Serial.printf("send text=\"%s\"\n", st.text);
-    st.len = 0;
-    st.text[0] = '\0';
-    resetPath();
-    st.lastCommitAt = now;
-    st.lastSymbolAt = now;
-    redrawCompose(now);
+    // Phase 1: hand the text to the net outbox (like the sim's queueSend)
+    // and clear the compose buffer immediately. The net task POSTs it and
+    // reports back; the loop turns that into a SENT / error toast.
+    const char* p = st.text;
+    while (*p == ' ') p++;
+    if (*p == '\0') {
+      st.len = 0;
+      st.text[0] = '\0';
+      resetPath();
+      st.lastCommitAt = now;
+      st.lastSymbolAt = now;
+      redrawCompose(now);
+      return;
+    }
+    if (netEnqueueSend(st.text)) {
+      Serial.printf("send queued text=\"%s\"\n", st.text);
+      st.len = 0;
+      st.text[0] = '\0';
+      resetPath();
+      st.lastCommitAt = now;
+      st.lastSymbolAt = now;
+      redrawCompose(now);
+      showToast("QUEUED", TOAST_WARN, now, 1500);
+    } else {
+      Serial.println("send: outbox full");
+      showToast("BUSY", TOAST_ERR, now, 1500);
+    }
   } else if (!strncmp(sel, "CLEAR", 5)) {
     st.len = 0;
     st.text[0] = '\0';
@@ -539,10 +586,10 @@ void setup() {
   inPressed    = false;
   preview      = PREVIEW_NONE;
 
-  // No network task yet (Phase 1): red dot = no WiFi. The future net task
-  // will call uiSetLink(LINK_WIFI) once WiFi is up and uiSetLink(LINK_OK)
-  // once the relay answers, and uiBadge()/uiFull() will repaint the dot.
-  uiSetLink(LINK_OFF);
+  // Phase 1: WiFi + relay. The net task owns uiSetLink() from here on:
+  // red = no WiFi, orange = WiFi without relay, green = both OK (sim parity).
+  netBegin();
+  lastLink = LINK_OFF;
   uiFull(st, now);
   uiBadge(0, now);
 
@@ -583,6 +630,38 @@ void loop() {
   uint32_t now = millis();
 
   pollSerialRx(now);
+
+  // Relay inbox: the net task polls GET /messages and queues arrivals here.
+  NetInbound in;
+  while (netPollInbound(&in)) {
+    inboxPush(in.text, now);
+    now = millis();
+  }
+  // Finished sends: QUEUED was shown at pick time; now show the outcome.
+  NetSendResult sr;
+  while (netPollSendResult(&sr)) {
+    if (sr.ok) showToast("SENT", TOAST_OK, now, 1500);
+    else showToast(sr.err[0] ? sr.err : "FAILED", TOAST_ERR, now, 2000);
+    now = millis();
+  }
+  // Link dot: repaint the top strip when the net task changes state.
+  {
+    uint8_t lk = netLink();
+    if (lk != lastLink) {
+      lastLink = lk;
+      uiSetLink(lk);
+      if (appMode == MODE_ACTIONS) redrawActions(now);
+      else if (appMode == MODE_MESSAGE) redrawMessage(now);
+      else {
+        uiFull(st, now);
+        uiBadge(inboxCount, now);
+      }
+      if (toastActive && (int32_t)(now - toastUntil) < 0)
+        uiToast(toastMsg, toastKind, now);
+      now = millis();
+    }
+  }
+
   maybeCommit(now);
   maybeWordSpace(now);
 
@@ -618,6 +697,12 @@ void loop() {
   } else if (lastProgressDraw != 0) {
     uiProgress(st, false, now);
     lastProgressDraw = 0;
+  }
+
+  // Expire the toast overlay by repainting whatever is underneath.
+  if (toastActive && (int32_t)(now - toastUntil) >= 0) {
+    toastActive = false;
+    repaintCurrent(now);
   }
 
   delay(5);

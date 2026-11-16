@@ -35,8 +35,10 @@ The board has two physical buttons: **BOOT** (GPIO0) and **RESET/EN**.
 
 The **top-left dot** is the link indicator on every screen: red = no WiFi
 connection, orange = WiFi OK but no connection to the relay, green = both OK.
-(The firmware has no network task yet, so a freshly flashed board shows red;
-the sim shows live orange/green against the real relay.)
+(The dot is live on both the board and the sim: red while WiFi connects,
+orange when WiFi is up but the relay is unreachable, green once the relay
+answers. An `AUTH ERR` toast after `SEND` means the device token in `.env`
+does not match the relay's.)
 
 **About the RESET/EN button.** On the IdeaSpark board the button labelled
 `RESET` (the left-hand button) is wired to the ESP32 `EN` pin, not a normal
@@ -53,9 +55,10 @@ example `27`). See [`docs/hardware.md`](docs/hardware.md).
 
 ## Relay server
 
-The LAN relay is a Python service in [`server/`](server/README.md). It is
-independent of the single-board trainer: the current firmware ignores it until
-Phase 1 adds WiFi and an outbox.
+The LAN relay is a Python service in [`server/`](server/README.md). Phase 1
+firmware joins the WiFi, POSTs outbound messages to it, and polls it for
+link status and inbound messages; the sim exercises the same path from the
+host.
 
 ```bash
 ./scripts/init-env.sh   # first run: creates .env with fresh tokens, chmod 600
@@ -115,10 +118,17 @@ Then:
 
 ```bash
 make check                        # toolchain + /dev/ttyUSB0 sanity check
-make build                        # compile only
-make upload PORT=/dev/ttyUSB0     # compile + flash
+make build DEVICE=dad             # compile only (needs secrets.h, see below)
+make upload-dad PORT=/dev/ttyUSB0 # regen dad secrets.h, compile + flash
+make upload-emma PORT=/dev/ttyUSB0
 make monitor PORT=/dev/ttyUSB0    # boot log + live key log @ 115200
 ```
+
+Flashing always regenerates `firmware/src/secrets.h` from `.env` for
+`DEVICE` (default `dad`), so one checkout flashes both boards:
+`make upload-dad`, swap the USB cable, `make upload-emma`. `make build`
+does not regenerate — run `make secrets DEVICE=emma` first if `secrets.h`
+is missing or stale.
 
 `make` stages the sources into `/tmp/morse-code-sketch` because `arduino-cli`
 wants a sketch folder. You can also use the standalone script:
