@@ -214,7 +214,7 @@ static void drawTree(const MorseState& st, uint32_t now) {
   for (uint8_t i = 0; i < MORSE_NODE_COUNT; i++) {
     const MorseNode& n = MORSE_NODES[i];
     if (n.letter == '\0') continue;
-    uint16_t c = COL_LABEL;
+    uint16_t c = COL_ORANGE;
     if (i == st.node) c = COL_GREEN_IN;
     if (burstOn && i == st.burstNode) c = st.burstError ? COL_RED : COL_GREEN_IN;
     char s[2] = { n.letter, '\0' };
