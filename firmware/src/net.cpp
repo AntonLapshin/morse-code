@@ -49,7 +49,8 @@ static QueueHandle_t qIn = nullptr;   // NetInbound, depth 8
 static QueueHandle_t qDone = nullptr; // NetSendResult, depth 8
 
 static volatile uint8_t s_link = LINK_OFF;
-static uint32_t s_lastSeq = 0;
+static uint32_t s_lastSeq = 0;   // highest seq handed to the UI (RX task only)
+static uint32_t s_ackedSeq = 0;  // highest seq acked to the relay
 static uint16_t s_bootId = 1;
 static uint32_t s_counter = 0;
 static Preferences s_prefs;
@@ -240,6 +241,25 @@ static size_t parseMessages(const String &body, ParsedMsg *out, size_t cap,
 // remove this comment without doing that work.
 static String baseUrl() { return String(SERVER_URL); }
 
+// Host part of SERVER_URL (no scheme/port/path), for diagnostics.
+static String serverHost() {
+  String u(SERVER_URL);
+  int p = u.indexOf("://");
+  if (p >= 0) u = u.substring((unsigned)p + 3);
+  int slash = u.indexOf('/');
+  if (slash >= 0) u = u.substring(0, (unsigned)slash);
+  int colon = u.indexOf(':');
+  if (colon >= 0) u = u.substring(0, (unsigned)colon);
+  return u;
+}
+
+static void logTlsError(WiFiClientSecure &client, const char *what, int code) {
+  char err[96] = {0};
+  client.lastError(err, sizeof(err));
+  Serial.printf("http: %s failed code=%d tls=\"%s\" heap=%u\n", what, code, err,
+                (unsigned)ESP.getFreeHeap());
+}
+
 static void secureClient(WiFiClientSecure &client) {
   client.setInsecure(); // see the TLS note above — v1 only, TODO pin the CA
 }
@@ -262,6 +282,8 @@ static int httpPostJson(const String &path, const String &payload,
     String body = http.getString();
     if (body.length() > 8192) body.remove(8192);
     respBody = body;
+  } else {
+    logTlsError(client, "POST", code);
   }
   http.end();
   return code;
@@ -285,54 +307,78 @@ static int httpGet(const String &path, String &respBody) {
     String body = http.getString();
     if (body.length() > 8192) body.remove(8192);
     respBody = body;
+  } else {
+    logTlsError(client, "GET", code);
   }
   http.end();
   return code;
 }
 
-// --- Net task ------------------------------------------------------------------
+// --- WiFi ---------------------------------------------------------------------
+static bool ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  setLink(LINK_OFF);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  {
+    String hn = String("morse-") + DEVICE_ID;
+    WiFi.setHostname(hn.c_str());
+  }
+  Serial.printf("net: wifi connecting to \"%s\"\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("net: wifi timeout, retry in 5s");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    return false;
+  }
+  Serial.printf("net: wifi ok ip=%s free_heap=%u\n",
+                WiFi.localIP().toString().c_str(),
+                (unsigned)ESP.getFreeHeap());
+  {
+    IPAddress ip;
+    if (WiFi.hostByName(serverHost().c_str(), ip))
+      Serial.printf("net: dns %s=%s\n", serverHost().c_str(),
+                    ip.toString().c_str());
+    else
+      Serial.printf("net: dns lookup failed for %s\n", serverHost().c_str());
+  }
+  setLink(LINK_WIFI);
+  return true;
+}
+
+// --- Net task: TX (one POST) then RX (one long-poll) per cycle ----------------
+// A single task with an 8 KB stack: two TLS tasks do not fit in the ESP32's
+// 320 KB alongside the 108 KB display canvas (two 6 KB stacks starve mbedTLS
+// with "SSL - Memory allocation failed"; two 4 KB stacks overflow). The
+// trade-off is documented in config.h: a SEND queued while the long-poll is
+// in flight waits for that poll to return (up to NET_POLL_WAIT_S).
 static void netTask(void * /*arg*/) {
   s_prefs.begin("morse", false);
   s_prefsOpen = true;
   loadLastSeq();
+  s_ackedSeq = s_lastSeq;
   Serial.printf("net: device=%s server=%s last_seq=%u proto_gen=%u\n", DEVICE_ID,
                 SERVER_URL, (unsigned)s_lastSeq, (unsigned)MORSE_PROTO_GEN);
 
+  bool firstPoll = true; // wait=0 once, so the dot goes green immediately
+  bool loggedStack = false;
   OutItem cur;
   bool haveCur = false;
   uint32_t backoffMs = 1000;
   uint32_t notBefore = 0;
 
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED) {
-      setLink(LINK_OFF);
-      WiFi.mode(WIFI_STA);
-      WiFi.persistent(false);
-      WiFi.setAutoReconnect(true);
-      WiFi.setSleep(false);
-      {
-        String hn = String("morse-") + DEVICE_ID;
-        WiFi.setHostname(hn.c_str());
-      }
-      Serial.printf("net: wifi connecting to \"%s\"\n", WIFI_SSID);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
-      uint32_t t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-        vTaskDelay(pdMS_TO_TICKS(250));
-      }
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("net: wifi timeout, retry in 5s");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        continue;
-      }
-      Serial.printf("net: wifi ok ip=%s\n",
-                    WiFi.localIP().toString().c_str());
-      setLink(LINK_WIFI);
-    }
-
+    if (!ensureWifi()) continue;
     uint32_t now = millis();
 
-    // --- TX: one POST per cycle ---------------------------------------------
+    // --- TX: one POST per cycle, before the blocking poll ------------------
     if (!haveCur && xQueueReceive(qOut, &cur, 0) == pdTRUE) haveCur = true;
     if (haveCur && (int32_t)(now - notBefore) >= 0) {
       String payload = String("{\"client_msg_id\":\"") + cur.cid +
@@ -341,20 +387,20 @@ static void netTask(void * /*arg*/) {
       String resp;
       int code = httpPostJson("/api/v1/messages", payload, resp);
       if (code == 200 || code == 201) {
-        long seq = 0;
-        if (findIntVal(resp, "seq", seq) && seq > 0 &&
-            (uint32_t)seq > s_lastSeq) {
-          s_lastSeq = (uint32_t)seq;
-          saveLastSeq();
-        }
+        // Do NOT advance s_lastSeq from the POST response. That was the 0.2.0
+        // message-loss bug: a send assigned seq N advanced last_seq to N, so
+        // the next RX poll since=N skipped a peer message with seq < N that
+        // had not been fetched yet. RX advances past our own sends via
+        // latest_seq instead.
         setLink(LINK_OK);
         NetSendResult r;
         r.ok = true;
         r.err[0] = '\0';
         xQueueSend(qDone, &r, 0);
-        Serial.printf("tx: ok seq=%ld text=\"%s\"\n", seq, cur.text);
+        Serial.printf("tx: ok text=\"%s\"\n", cur.text);
         haveCur = false;
         backoffMs = 1000;
+        notBefore = 0;
       } else if (code == 401) {
         NetSendResult r;
         r.ok = false;
@@ -362,7 +408,7 @@ static void netTask(void * /*arg*/) {
         xQueueSend(qDone, &r, 0);
         Serial.println("tx: 401 auth rejected (token mismatch with relay .env?)");
         setLink(LINK_WIFI);
-        haveCur = false; // drop: sim parity, a wrong token never fixes itself
+        haveCur = false; // drop: a wrong token never fixes itself
       } else if (code == 400 || code == 404 || code == 413) {
         NetSendResult r;
         r.ok = false;
@@ -385,76 +431,122 @@ static void netTask(void * /*arg*/) {
         setLink(LINK_WIFI);
         notBefore = now + backoffMs;
         backoffMs = backoffMs * 2 > 30000 ? 30000 : backoffMs * 2;
-      } else { // transport failure / timeout
+      } else { // transport / TLS failure
         Serial.printf("tx: unreachable, retry in %ums\n",
                       (unsigned)backoffMs);
         setLink(LINK_WIFI);
         notBefore = now + backoffMs;
         backoffMs = backoffMs * 2 > 30000 ? 30000 : backoffMs * 2;
       }
+      // Fall through to the RX poll below so link state refreshes promptly.
     }
 
-    // --- RX poll: long-poll wait=NET_POLL_WAIT_S (20 s) -----------------------
-    // A SEND queued while this poll is in flight waits for the poll to
-    // return before it is POSTed (up to NET_POLL_WAIT_S); the UI already
-    // shows QUEUED, then SENT. That is the price of staying inside the
-    // Workers Free request budget — see config.h / worker/README.md.
-    {
-      char path[64];
-      snprintf(path, sizeof(path),
-               "/api/v1/messages?since=%u&wait=%d&limit=8",
-               (unsigned)s_lastSeq, NET_POLL_WAIT_S);
-      String resp;
-      int code = httpGet(path, resp);
-      if (code == 200) {
-        long latest = (long)s_lastSeq;
-        ParsedMsg msgs[8];
-        size_t n = parseMessages(resp, msgs, 8, latest);
-        bool advanced = false;
-        for (size_t i = 0; i < n; i++) {
-          if (msgs[i].seq <= 0 || (uint32_t)msgs[i].seq <= s_lastSeq) continue;
-          if (msgs[i].text.length() == 0) {
-            if ((uint32_t)msgs[i].seq > s_lastSeq) {
-              s_lastSeq = (uint32_t)msgs[i].seq;
-              advanced = true;
-            }
-            continue;
-          }
-          NetInbound in;
-          in.seq = (uint32_t)msgs[i].seq;
-          size_t L = msgs[i].text.length();
-          if (L > MSG_TEXT_MAX) L = MSG_TEXT_MAX;
-          memcpy(in.text, msgs[i].text.c_str(), L);
-          in.text[L] = '\0';
-          if (xQueueSend(qIn, &in, 0) != pdTRUE) break; // full: retry next poll
-          s_lastSeq = in.seq;
+    // --- RX: one long-poll --------------------------------------------------
+    // The first request after boot uses wait=0: a 20 s long-poll would keep
+    // the dot orange for 20 s even though the relay is reachable. Every later
+    // request long-polls so the Workers request budget stays low.
+    int waitS = firstPoll ? 0 : NET_POLL_WAIT_S;
+    char path[64];
+    snprintf(path, sizeof(path),
+             "/api/v1/messages?since=%u&wait=%d&limit=8",
+             (unsigned)s_lastSeq, waitS);
+    String resp;
+    int code = httpGet(path, resp);
+
+    if (code == 200) {
+      firstPoll = false;
+      backoffMs = 1000;
+      if (!loggedStack) {
+        loggedStack = true;
+        Serial.printf("net: rx stack free=%u heap=%u\n",
+                      (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+                      (unsigned)ESP.getFreeHeap());
+      }
+
+      long latest = -1;
+      bool haveLatest = findIntVal(resp, "latest_seq", latest);
+
+      // The relay's sequence space restarted (new DO / restored database)
+      // while this board still had a higher last_seq. Without this check the
+      // board would poll since=<high> forever and never see seq 1..N again.
+      if (haveLatest && latest >= 0 && (uint32_t)latest < s_lastSeq) {
+        Serial.printf("rx: server latest_seq=%ld < last_seq=%u, resetting\n",
+                      latest, (unsigned)s_lastSeq);
+        s_lastSeq = 0;
+        s_ackedSeq = 0;
+        saveLastSeq();
+        setLink(LINK_OK);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+
+      bool parsedOk = resp.indexOf("\"messages\"") >= 0;
+      ParsedMsg msgs[8];
+      size_t n = parseMessages(resp, msgs, 8, latest);
+      bool advanced = false;
+      bool queueFull = false;
+
+      for (size_t i = 0; i < n; i++) {
+        if (msgs[i].seq <= 0 || (uint32_t)msgs[i].seq <= s_lastSeq) continue;
+        if (msgs[i].text.length() == 0) {
+          s_lastSeq = (uint32_t)msgs[i].seq;
           advanced = true;
-          Serial.printf("rx: seq=%u len=%u\n", (unsigned)in.seq,
-                        (unsigned)L);
+          continue;
         }
-        if (latest > 0 && (uint32_t)latest > s_lastSeq) {
-          s_lastSeq = (uint32_t)latest; // truncated window: jump like the sim
-          advanced = true;
+        NetInbound in;
+        in.seq = (uint32_t)msgs[i].seq;
+        size_t L = msgs[i].text.length();
+        if (L > MSG_TEXT_MAX) L = MSG_TEXT_MAX;
+        memcpy(in.text, msgs[i].text.c_str(), L);
+        in.text[L] = '\0';
+        if (xQueueSend(qIn, &in, 0) != pdTRUE) {
+          // The UI has not drained the queue yet. Keep last_seq at the last
+          // item actually queued so the next poll re-fetches the rest.
+          // Jumping to latest_seq here would silently drop them.
+          queueFull = true;
+          break;
         }
-        if (advanced) saveLastSeq();
-        // Best-effort ack so the relay unread count tracks the device.
+        s_lastSeq = in.seq;
+        advanced = true;
+        Serial.printf("rx: seq=%u len=%u\n", (unsigned)in.seq, (unsigned)L);
+      }
+
+      // Advance over seqs that are not ours (our own sends, direct messages to
+      // the peer). Safe only when every matching message was consumed; never
+      // when the UI queue was full. A truncated window intentionally keeps the
+      // newest limit messages, so the older ones are skipped by design.
+      if (!queueFull && parsedOk && haveLatest && latest >= 0 &&
+          (uint32_t)latest > s_lastSeq) {
+        s_lastSeq = (uint32_t)latest;
+        advanced = true;
+      }
+      if (advanced) saveLastSeq();
+
+      // Best-effort ack so the relay unread count tracks what this device has
+      // actually received. Skip the POST when nothing new arrived.
+      if (s_lastSeq > s_ackedSeq) {
         char ack[32];
         snprintf(ack, sizeof(ack), "{\"upto_seq\":%u}", (unsigned)s_lastSeq);
         String aresp;
-        httpPostJson("/api/v1/ack", ack, aresp);
-        setLink(LINK_OK);
-      } else if (code == 401) {
-        setLink(LINK_WIFI);
-      } else {
-        setLink(LINK_WIFI);
+        if (httpPostJson("/api/v1/ack", ack, aresp) == 200) {
+          s_ackedSeq = s_lastSeq;
+        }
       }
-    }
 
-    UBaseType_t waiting = qOut ? uxQueueMessagesWaiting(qOut) : 0;
-    if (haveCur || waiting > 0)
-      vTaskDelay(pdMS_TO_TICKS(250));
-    else
-      vTaskDelay(pdMS_TO_TICKS(2000));
+      setLink(LINK_OK);
+      // No extra 2 s idle delay: the long-poll already paces the loop, and a
+      // message that arrives during a gap would otherwise wait for it.
+      vTaskDelay(pdMS_TO_TICKS(queueFull ? 50 : 100));
+    } else if (code == 401) {
+      Serial.println("rx: 401 auth rejected (token mismatch with relay .env?)");
+      setLink(LINK_WIFI);
+      vTaskDelay(pdMS_TO_TICKS(60000));
+    } else {
+      Serial.printf("rx: HTTP %d, retry in %ums\n", code, (unsigned)backoffMs);
+      setLink(LINK_WIFI);
+      vTaskDelay(pdMS_TO_TICKS(backoffMs));
+      backoffMs = backoffMs * 2 > 15000 ? 15000 : backoffMs * 2;
+    }
   }
 }
 

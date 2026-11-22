@@ -119,7 +119,8 @@ Re-flashing after the 0.2.0 cutover is required, not optional: the DO
 starts with an empty database and `seq` restarts at 1, so a board that
 kept its LAN-era `last_seq` would ignore every new message. The firmware
 resets `last_seq` to 0 on first boot after re-flash via the `proto_gen`
-NVS key (`MORSE_PROTO_GEN = 2` in `firmware/src/config.h`).
+NVS key (`MORSE_PROTO_GEN = 3` in `firmware/src/config.h`; 3 also recovers
+boards that ran the 0.2.0 TX bug which skipped peer messages after a send).
 
 ## How it works
 
@@ -325,6 +326,10 @@ letter 'I'  text="E I"
 | Custom domain returns `302 Found` / `openresty` | The host still points at the old origin. `make worker-deploy` uses `--domain`, which rewrites the proxied DNS record; re-run it and wait for the certificate. |
 | `/api/v1/health` → `500 config_error` "must differ" | Deployed tokens are wrong/identical. `make worker-secrets` pushes the distinct values from `.env`; re-check with `curl "$MORSE_SERVER_URL/api/v1/health"`. |
 | No Durable Object in the dashboard | Deploy with the repo's `wrangler.toml` (`make worker-deploy`). A dashboard/drag-and-drop upload has no `[[migrations]]`, so no `MorseRelay` namespace is created. |
+| Dot stays orange ~20 s after WiFi connects | Old firmware: the first poll used the full 20 s long-poll. Current firmware sends the first poll with `wait=0`, so the dot turns green within a few seconds of WiFi. Re-flash both boards. |
+| `QUEUED` → `SENT` takes up to ~20 s | By design on the ESP32: one network task shares the 20 s long-poll (two TLS tasks do not fit next to the 108 KB canvas in 320 KB RAM), so a SEND queued mid-poll waits for that poll. Random 1–20 s is the wait remainder, not a failure. |
+| Peer messages never arrive (badge stays empty) | Old firmware advanced `last_seq` to its own send's `seq`, skipping lower-numbered peer messages. Fixed: sends never move `last_seq`; the RX poll advances past them via `latest_seq`. Re-flash **both** boards — `MORSE_PROTO_GEN = 3` resets `last_seq` to 0 once, recovering anything skipped. |
+| Inbox empty after a reboot | Fixed: the inbox (up to 8 messages) is now persisted in NVS and restored on boot; new arrivals auto-open when the board is idle in COMPOSE. |
 
 ## Repository layout
 

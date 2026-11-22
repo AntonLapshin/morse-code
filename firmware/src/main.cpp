@@ -5,6 +5,7 @@
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <Preferences.h>
 #include <esp_system.h>
 
 #include "config.h"
@@ -83,6 +84,53 @@ static AppMode appMode = MODE_COMPOSE;
 static InboxMsg  inbox[INBOX_MAX];
 static uint8_t   inboxCount = 0;
 static uint32_t  nextMsgId  = 1;
+
+// The inbox lives in RAM on the UI side, but last_seq is durable. Without a
+// durable inbox a reset/reflash would leave last_seq advanced past messages
+// the user never saw, so the relay would never re-deliver them. Persist the
+// small ring (max 8 messages) in NVS under its own namespace; the proto_gen
+// tag makes a deliberate sequence-space reset also clear stale messages.
+static const uint32_t INBOX_MAGIC = 0x4D534731; // "MSG1"
+struct InboxStore {
+  uint32_t magic;
+  uint32_t protoGen;
+  uint8_t  count;
+  uint8_t  pad[3];
+  InboxMsg msgs[INBOX_MAX];
+};
+
+static void saveInbox() {
+  InboxStore s;
+  memset(&s, 0, sizeof(s));
+  s.magic = INBOX_MAGIC;
+  s.protoGen = MORSE_PROTO_GEN;
+  s.count = inboxCount;
+  memcpy(s.msgs, inbox, sizeof(inbox));
+  Preferences p;
+  if (p.begin("morseui", false)) {
+    p.putBytes("inbox", &s, sizeof(s));
+    p.end();
+  }
+}
+
+static void loadInbox() {
+  Preferences p;
+  if (!p.begin("morseui", true)) return;
+  InboxStore s;
+  size_t len = p.getBytesLength("inbox");
+  if (len == sizeof(s) && p.getBytes("inbox", &s, len) == len &&
+      s.magic == INBOX_MAGIC && s.protoGen == MORSE_PROTO_GEN &&
+      s.count <= INBOX_MAX) {
+    memcpy(inbox, s.msgs, sizeof(inbox));
+    inboxCount = s.count;
+    for (uint8_t i = 0; i < inboxCount; i++) {
+      inbox[i].text[MSG_TEXT_MAX] = '\0';
+      if (inbox[i].id >= nextMsgId) nextMsgId = inbox[i].id + 1;
+    }
+    Serial.printf("inbox: restored %u unread\n", (unsigned)inboxCount);
+  }
+  p.end();
+}
 
 // ACTIONS sheet state.
 static char      actionBuf[5][16];
@@ -298,6 +346,7 @@ static void inboxRemoveAt(uint8_t idx) {
   Serial.printf("read msg #%u gone\n", (unsigned)inbox[idx].id);
   for (uint8_t i = idx; i + 1 < inboxCount; i++) inbox[i] = inbox[i + 1];
   inboxCount--;
+  saveInbox();
 }
 
 // Newest-first insert; drops the oldest when full. Each message gets a unique
@@ -317,6 +366,7 @@ static void inboxPush(const char* text, uint32_t now) {
   for (uint8_t i = inboxCount; i > 0; i--) inbox[i] = inbox[i - 1];
   inbox[0] = m;
   inboxCount++;
+  saveInbox();
   Serial.printf("rx msg #%u len=%u unread=%u\n", (unsigned)m.id, (unsigned)n,
                 (unsigned)inboxCount);
   if (appMode == MODE_COMPOSE) {
@@ -624,13 +674,17 @@ void setup() {
   inPressed    = false;
   preview      = PREVIEW_NONE;
 
+  // Restore unread messages before the net tasks start, so a reboot does not
+  // lose messages that were already counted in last_seq.
+  loadInbox();
+
   // WiFi + Cloudflare Worker relay (0.2.0). The net task owns uiSetLink()
   // from here on: red = no WiFi, orange = WiFi without relay, green = both
   // OK (sim parity).
   netBegin();
   lastLink = LINK_OFF;
   uiFull(st, now);
-  uiBadge(0, now);
+  uiBadge(inboxCount, now);
 
   Serial.println();
   Serial.println("morse-code v2");
@@ -671,9 +725,19 @@ void loop() {
   pollSerialRx(now);
 
   // Relay inbox: the net task polls GET /messages and queues arrivals here.
+  // When the board is idle in COMPOSE, open the newest one immediately; the
+  // badge alone is easy to miss. While composing, only the badge changes so a
+  // press in progress is never stolen.
   NetInbound in;
+  bool autoOpened = false;
   while (netPollInbound(&in)) {
+    bool idle = (appMode == MODE_COMPOSE && st.len == 0 && !inPressed &&
+                 !inputDownRaw());
     inboxPush(in.text, now);
+    if (idle && !autoOpened && appMode == MODE_COMPOSE) {
+      enterMessage(now, 0);
+      autoOpened = true;
+    }
     now = millis();
   }
   // Finished sends: QUEUED was shown at pick time; now show the outcome.
