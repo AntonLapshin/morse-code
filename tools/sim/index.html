@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>morse-code sim — Dad + Emma via relay</title>
+<title>morse-code sim — Dad + Emma via Worker</title>
 <style>
   :root { color-scheme: dark; }
   body { background:#080c18; color:#d8e2f4; font-family:ui-monospace,Menlo,Consolas,monospace; margin:0; padding:16px; }
@@ -40,13 +40,12 @@
 </head>
 <body>
 <h1>MORSE-CODE SIM — DAD + EMMA <span id="unreadTop"></span></h1>
-<p class="sub">Two virtual ESP32s with the real panel renderer (<code>170×320</code>). <b>SEND</b> (Morse action sheet or the send box) posts to the <b>real relay</b> and appears on the other panel. Top-left dot: <b style="color:#ff5a4e">red</b>=no wifi, <b style="color:#ff9f0a">orange</b>=wifi ok / relay down, <b style="color:#46eb37">green</b>=both ok.</p>
+<p class="sub">Two virtual ESP32s with the real panel renderer (<code>170×320</code>). <b>SEND</b> (Morse action sheet or the send box) posts to the <b>real Worker</b> and appears on the other panel. Top-left dot: <b style="color:#ff5a4e">red</b>=no wifi, <b style="color:#ff9f0a">orange</b>=wifi ok / relay down, <b style="color:#46eb37">green</b>=both ok. The sim is plain HTTP and cannot do TLS, so it talks to the <b>local</b> Worker only (<code>http://localhost:8787</code> — run <code>make worker-dev</code> first); test production with <code>curl</code>, not here.</p>
 
 <div class="panel" id="relaybar">
   <h2>RELAY <span id="relayDot"></span></h2>
   <div class="row">
-    <label>host <input id="rhost" class="short" type="text" value="192.168.4.44"></label>
-    <label>port <input id="rport" class="tiny" type="text" value="8180"></label>
+    <label>server URL <input id="rurl" type="text" value="http://localhost:8787" style="width:260px"></label>
     <button id="rsave">save</button>
     <span id="rstatus" class="meta">…</span>
   </div>
@@ -54,7 +53,7 @@
     <label>dad token <input id="rdad" type="password" value=""></label>
     <label>emma token <input id="remma" type="password" value=""></label>
   </div>
-  <p class="hint">Tokens live in the relay machine's <code>.env</code> (<code>MORSE_TOKEN_DAD / _EMMA</code>). This laptop's <code>.env</code> may differ — if the dot stays orange with a <code>401</code> error, paste the relay's tokens here and press save. A <code>401</code> always means token mismatch, not a broken server.</p>
+  <p class="hint">Tokens live in <code>.env</code> (<code>MORSE_TOKEN_DAD / _EMMA</code>) — the same tokens go in <code>worker/.dev.vars</code> for the local Worker and in <code>make worker-secrets</code> for production. If the dot stays orange with a <code>401</code> error, paste the local Worker's tokens here and press save. A <code>401</code> always means token mismatch, not a broken server. Do not paste an <code>https://</code> URL here: the sim cannot do TLS.</p>
 </div>
 
 <div class="wrap" style="margin-top:12px">
@@ -173,13 +172,12 @@ async function refreshRelay() {
   try {
     const r = await fetch('/api/relay', {cache:'no-store'});
     const s = await r.json();
-    document.getElementById('rhost').value = s.host || '';
-    document.getElementById('rport').value = s.port || '';
+    document.getElementById('rurl').value = s.url || '';
     const dot = document.getElementById('relayDot');
     const ok = s.dad && s.emma && s.dad.link === 2 && s.emma.link === 2;
     const half = s.dad && s.emma && (s.dad.link >= 1 || s.emma.link >= 1);
     dot.innerHTML = '<span style="color:' + (ok ? '#46eb37' : (half ? '#ff9f0a' : '#ff5a4e')) + '">●</span>';
-    let st = '<b>' + escapeHtml(s.host) + ':' + s.port + '</b> dad:<b>' + escapeHtml(s.dad.linkName) + '</b>#' + s.dad.lastSeq + ' emma:<b>' + escapeHtml(s.emma.linkName) + '</b>#' + s.emma.lastSeq;
+    let st = '<b>' + escapeHtml(s.url) + '</b> dad:<b>' + escapeHtml(s.dad.linkName) + '</b>#' + s.dad.lastSeq + ' emma:<b>' + escapeHtml(s.emma.linkName) + '</b>#' + s.emma.lastSeq;
     if (s.dad.error) st += ' <span class="err">dad: ' + escapeHtml(s.dad.error) + '</span>';
     if (s.emma.error) st += ' <span class="err">emma: ' + escapeHtml(s.emma.error) + '</span>';
     document.getElementById('rstatus').innerHTML = st;
@@ -278,8 +276,7 @@ for (const dev of DEVS) {
 }
 document.getElementById('rsave').onclick = async () => {
   const body = JSON.stringify({
-    host: document.getElementById('rhost').value.trim(),
-    port: parseInt(document.getElementById('rport').value.trim(), 10) || 8180,
+    url: document.getElementById('rurl').value.trim(),
     dadToken: document.getElementById('rdad').value.trim(),
     emmaToken: document.getElementById('remma').value.trim(),
     enabled: true

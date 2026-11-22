@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -26,11 +27,8 @@
 #ifndef WIFI_PASS
 #error "WIFI_PASS missing in secrets.h"
 #endif
-#ifndef SERVER_HOST
-#error "SERVER_HOST missing in secrets.h"
-#endif
-#ifndef SERVER_PORT
-#error "SERVER_PORT missing in secrets.h"
+#ifndef SERVER_URL
+#error "SERVER_URL missing in secrets.h - regenerate with ./scripts/gen-secrets.py (0.2.0: MORSE_SERVER_URL)"
 #endif
 #ifndef DEVICE_ID
 #error "DEVICE_ID missing in secrets.h"
@@ -64,6 +62,23 @@ static void setLink(uint8_t link) {
 
 static void loadLastSeq() {
   if (!s_prefsOpen) return;
+  // Migration trap (0.2.0): the Worker + DO starts with an EMPTY database,
+  // so seq restarts at 1. A board that kept its LAN-era last_seq (e.g. 42)
+  // would poll since=42 and ignore every new message forever, because
+  // both the firmware and the sim drop messages with seq <= lastSeq.
+  // proto_gen is bumped whenever the server side restarts its sequence
+  // space; a mismatch resets last_seq to 0 on first boot after re-flash.
+  // LAN history does NOT migrate — finish or abandon any pending LAN
+  // exchange before flashing (see worker/MIGRATION.md).
+  uint32_t gen = s_prefs.getUInt("proto_gen", 0);
+  if (gen != MORSE_PROTO_GEN) {
+    Serial.printf("net: proto_gen %u -> %u, resetting last_seq to 0\n",
+                  (unsigned)gen, (unsigned)MORSE_PROTO_GEN);
+    s_lastSeq = 0;
+    s_prefs.putUInt("proto_gen", MORSE_PROTO_GEN);
+    s_prefs.putUInt("last_seq", 0);
+    return;
+  }
   s_lastSeq = s_prefs.getUInt("last_seq", 0);
 }
 
@@ -212,23 +227,34 @@ static size_t parseMessages(const String &body, ParsedMsg *out, size_t cap,
 }
 
 // --- HTTP helpers (net task only) --------------------------------------------
-static String baseUrl() {
-  String url = "http://";
-  url += SERVER_HOST;
-  url += ":";
-  url += String(SERVER_PORT);
-  return url;
+// HTTPS to the Cloudflare Worker (SERVER_URL, e.g.
+// https://morse.gulfrenderstudio.com). TLS DECISION (0.2.0, deliberate):
+// the client runs with setInsecure() — the certificate chain is NOT
+// verified or pinned. That is the same trust level as the LAN MVP it
+// replaces (plain HTTP on a trusted home WiFi), and it avoids bundling a
+// CA that Cloudflare can rotate. It is NOT as safe as a pinned chain:
+// a network attacker who can intercept the board's traffic could present
+// any certificate and read/replay the bearer token and message text.
+// TODO: bundle the Cloudflare CA (or the ISRG root) and switch to
+// client.setCACert(...) once the chain is verified on-device. Do not
+// remove this comment without doing that work.
+static String baseUrl() { return String(SERVER_URL); }
+
+static void secureClient(WiFiClientSecure &client) {
+  client.setInsecure(); // see the TLS note above — v1 only, TODO pin the CA
 }
 
 static int httpPostJson(const String &path, const String &payload,
                         String &respBody) {
   respBody = "";
+  WiFiClientSecure client;
+  secureClient(client);
   HTTPClient http;
   http.setConnectTimeout(5000);
   http.setTimeout(10000);
   http.setReuse(false);
   String url = baseUrl() + path;
-  if (!http.begin(url)) return -1;
+  if (!http.begin(client, url)) return -1;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
   int code = http.POST(payload);
@@ -243,12 +269,16 @@ static int httpPostJson(const String &path, const String &payload,
 
 static int httpGet(const String &path, String &respBody) {
   respBody = "";
+  WiFiClientSecure client;
+  secureClient(client);
   HTTPClient http;
   http.setConnectTimeout(5000);
-  http.setTimeout(8000);
+  // Long-poll: the Worker answers at NET_POLL_WAIT_S, so the timeout
+  // must clear it (plus margin) or every poll dies as a transport error.
+  http.setTimeout((NET_POLL_WAIT_S + 5) * 1000);
   http.setReuse(false);
   String url = baseUrl() + path;
-  if (!http.begin(url)) return -1;
+  if (!http.begin(client, url)) return -1;
   http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
   int code = http.GET();
   if (code > 0) {
@@ -265,8 +295,8 @@ static void netTask(void * /*arg*/) {
   s_prefs.begin("morse", false);
   s_prefsOpen = true;
   loadLastSeq();
-  Serial.printf("net: device=%s relay=%s:%d last_seq=%u\n", DEVICE_ID,
-                SERVER_HOST, (int)SERVER_PORT, (unsigned)s_lastSeq);
+  Serial.printf("net: device=%s server=%s last_seq=%u proto_gen=%u\n", DEVICE_ID,
+                SERVER_URL, (unsigned)s_lastSeq, (unsigned)MORSE_PROTO_GEN);
 
   OutItem cur;
   bool haveCur = false;
@@ -364,12 +394,16 @@ static void netTask(void * /*arg*/) {
       }
     }
 
-    // --- RX poll: wait=0 so TX stays responsive (sim uses the same) ----------
+    // --- RX poll: long-poll wait=NET_POLL_WAIT_S (20 s) -----------------------
+    // A SEND queued while this poll is in flight waits for the poll to
+    // return before it is POSTed (up to NET_POLL_WAIT_S); the UI already
+    // shows QUEUED, then SENT. That is the price of staying inside the
+    // Workers Free request budget — see config.h / worker/README.md.
     {
       char path[64];
       snprintf(path, sizeof(path),
-               "/api/v1/messages?since=%u&wait=0&limit=8",
-               (unsigned)s_lastSeq);
+               "/api/v1/messages?since=%u&wait=%d&limit=8",
+               (unsigned)s_lastSeq, NET_POLL_WAIT_S);
       String resp;
       int code = httpGet(path, resp);
       if (code == 200) {

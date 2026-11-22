@@ -54,5 +54,22 @@
 #define INBOX_MAX         8    // max stored incoming messages (each gone on read)
 #define MSG_TEXT_MAX      96   // max chars per incoming message on the display
 
+// --- Cloudflare relay (0.2.0) ------------------------------------------------
+// The relay is a Cloudflare Worker + Durable Object at MORSE_SERVER_URL
+// (see worker/README.md). The long-poll wait is 20 s: at wait=0 the two
+// boards would burn ~43,200 requests/day each against the Workers Free
+// 100,000/day limit; at wait=20 it is ~4,320/day each. Trade-off: a SEND
+// queued while a long-poll is in flight waits for that poll to return
+// (up to NET_POLL_WAIT_S) before it is POSTed — the UI shows QUEUED, then
+// SENT. See worker/README.md for the DO-duration side of the same trade.
+#define NET_POLL_WAIT_S   20
+
+// Protocol generation, persisted in NVS next to last_seq (see net.cpp).
+// The Worker + DO starts with an EMPTY database, so seq restarts at 1:
+// a board that kept its LAN-era last_seq (e.g. 42) would poll since=42
+// and ignore every new message forever. Bump this whenever the server
+// side restarts its sequence space; a mismatch resets last_seq to 0.
+#define MORSE_PROTO_GEN   2
+
 // --- Result text -------------------------------------------------------------
 #define TEXT_MAX          96

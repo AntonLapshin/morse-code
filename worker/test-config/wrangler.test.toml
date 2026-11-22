@@ -1,0 +1,32 @@
+# Test-only Wrangler config for `npm run test:workers`. Mirrors
+# worker/wrangler.toml minus the production route, plus fake bearer <redacted>
+# as plain vars. NEVER deploy with this file, and never put real tokens here.
+#
+# WHY THIS FILE LIVES IN A SUBDIRECTORY: the @cloudflare/vitest-plugin /
+# miniflare loads `.dev.vars` from the directory of the Wrangler config
+# and lets it override the config's own vars. With the config next to
+# worker/.dev.vars (CHANGEME placeholders after `make setup`), the fake
+# test tokens here lost and every /api/v1/* call failed with 500
+# config_error — so `make worker-test` failed on a fresh clone. (Real
+# tokens in .dev.vars would break it the other way: the tests send the
+# fake tokens and would get 401.) The subdir has no .dev.vars, so the fake
+# tokens in this file win and the integration suite is independent of
+# whatever is in worker/.dev.vars.
+name = "morse-code-test"
+main = "../src/index.js"
+compatibility_date = "2026-11-21"
+workers_dev = true
+
+[vars]
+MORSE_DAD_NAME = "DAD"
+MORSE_EMMA_NAME = "EMMA"
+MORSE_TOKEN_DAD = "test-token-dad-0000000000000001"
+MORSE_TOKEN_EMMA = "test-token-emma-0000000000000002"
+
+[[durable_objects.bindings]]
+name = "MORSE_RELAY"
+class_name = "MorseRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MorseRelay"]

@@ -1,0 +1,18 @@
+{
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.166.0"
+  },
+  "name": "morse-code-worker",
+  "private": true,
+  "scripts": {
+    "deploy": "bash ../scripts/worker-deploy.sh",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "test": "vitest run --config vitest.config.mjs",
+    "test:workers": "vitest run --config vitest.workers.config.mjs"
+  },
+  "type": "module",
+  "version": "0.2.0"
+}

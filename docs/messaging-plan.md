@@ -1,6 +1,18 @@
 # WiFi messaging plan — two ESP32s + Omarchy laptop relay
 
-**Status:** proposed, not implemented  
+> **SUPERSEDED in 0.2.0.** The LAN relay described here (FastAPI on the
+> Omarchy laptop, port 8180) was replaced by a Cloudflare Worker +
+> Durable Object at `morse.gulfrenderstudio.com`. The live docs are
+> [`worker/README.md`](../worker/README.md) (setup, API, deploy) and
+> [`worker/MIGRATION.md`](../worker/MIGRATION.md) (cutover + laptop
+> cleanup, including the `ufw` 8180 rule). This file is kept as history:
+> the protocol (§5), the one-button UX (§8), and the firmware design
+> (§7) are still the design the Worker port implements — only the
+> transport and the server in §6 changed (HTTPS to the Worker instead
+> of plain HTTP to the laptop; `wait=20` long-poll instead of `wait=0`;
+> no laptop, no open port, no systemd unit).
+
+**Status:** superseded by the Cloudflare Worker + DO (0.2.0)
 **Date:** 2026-11-16  
 **Scope:** LAN-only family messaging between two Morse-code ESP32 devices, with a
 long-running Omarchy laptop as the relay. Phone/watch delivery is a later bridge

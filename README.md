@@ -11,11 +11,13 @@ The look follows [`ui.jpeg`](ui.jpeg): dark navy background, pale-yellow title,
 slate circuit-tree with circular (dot) and rectangular (dash) nodes, and a
 bright green glow on the node you are currently on.
 
-> **Planned:** LAN messaging between two ESP32s, relayed by a long-running
-> Omarchy laptop, with an incoming-message UI and a one-button send flow.
-> See [`docs/messaging-plan.md`](docs/messaging-plan.md).
-> Phase 0 (the relay server) is in place under [`server/`](server/README.md);
-> the firmware side starts in Phase 1.
+> **Messaging is live over the internet:** two ESP32s exchange messages
+> through a Cloudflare Worker + Durable Object at
+> `morse.gulfrenderstudio.com` — no laptop server, no open port. See
+> [`worker/README.md`](worker/README.md) and the cutover checklist in
+> [`worker/MIGRATION.md`](worker/MIGRATION.md). The original LAN plan is
+> kept as history in [`docs/messaging-plan.md`](docs/messaging-plan.md)
+> (marked superseded there).
 
 ## Controls
 
@@ -53,25 +55,39 @@ example `27`). See [`docs/hardware.md`](docs/hardware.md).
 > GPIO0 is also the ESP32 boot-strap pin. Do not hold BOOT while resetting or
 > flashing, or the board will enter the serial bootloader instead of the app.
 
-## Relay server
+## Relay: Cloudflare Worker + Durable Object
 
-The LAN relay is a Python service in [`server/`](server/README.md). Phase 1
-firmware joins the WiFi, POSTs outbound messages to it, and polls it for
-link status and inbound messages; the sim exercises the same path from the
-host.
+The relay is a Cloudflare Worker + Durable Object in [`worker/`](worker/README.md).
+The firmware joins the WiFi, POSTs outbound messages to it over HTTPS, and
+long-polls it (20 s wait) for link status and inbound messages; the sim
+exercises the same path from the host against the *local* Worker dev server.
+No laptop needs to run, no port is open, and the boards work from anywhere
+with internet — including Emma's place, not just the home LAN.
 
 ```bash
 ./scripts/init-env.sh   # first run: creates .env with fresh tokens, chmod 600
-$EDITOR .env            # set WIFI_SSID + WIFI_PASS, check RELAY_HOST
-cd server
-uv sync
-make start              # background uvicorn, waits for /health
+$EDITOR .env            # set WIFI_SSID + WIFI_PASS, check MORSE_SERVER_URL
+make setup              # installs worker deps, copies worker/.dev.vars.example
+make worker-dev         # local Worker at http://localhost:8787
+make worker-test        # worker unit + integration tests
 ```
 
-From the repo root: `make start`, `make stop`, `make restart` (add
-`RELAY_PORT=...` to bind elsewhere). Logs live in `server/.run/`. Run one
-worker only. Secrets live in `.env` (gitignored); see
-[`server/README.md`](server/README.md) for setup, the API, and the smoke test.
+Deploying (see [`worker/MIGRATION.md`](worker/MIGRATION.md) for the full
+cutover checklist, including deleting the old laptop relay and its `ufw`
+8180 rule — history does NOT migrate, and both boards must be re-flashed):
+
+```bash
+make worker-login       # first time only
+make worker-secrets     # sets MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA as Worker secrets
+make worker-deploy      # attaches the morse.gulfrenderstudio.com route
+```
+
+Secrets live in `.env` (gitignored); see
+[`worker/README.md`](worker/README.md) for setup, the API, free-tier
+limits, and the curl smoke test. One deliberate trade-off to know about:
+the ESP32 uses `WiFiClientSecure` with `setInsecure()` in 0.2.0 — the
+certificate chain is not verified or pinned (see the comment in
+`firmware/src/net.cpp`); pinning the Cloudflare CA is a TODO.
 
 Flashing a board copies its slice of `.env` into the firmware:
 
@@ -79,6 +95,12 @@ Flashing a board copies its slice of `.env` into the firmware:
 ./scripts/gen-secrets.py dad    # then make upload, or:
 ./firmware/build-arduino-cli.sh --device dad --upload /dev/ttyUSB0
 ```
+
+Re-flashing after the 0.2.0 cutover is required, not optional: the DO
+starts with an empty database and `seq` restarts at 1, so a board that
+kept its LAN-era `last_seq` would ignore every new message. The firmware
+resets `last_seq` to 0 on first boot after re-flash via the `proto_gen`
+NVS key (`MORSE_PROTO_GEN = 2` in `firmware/src/config.h`).
 
 ## How it works
 
@@ -174,7 +196,7 @@ montages them with ImageMagick. The preview uses the *real* tree table and
 renderer, so a coordinate fix there is a coordinate fix on the device.
 Requirements: a C++17 compiler and ImageMagick (`magick`).
 
-## Display simulator (live web UI, 2 devices + real relay)
+## Display simulator (live web UI, 2 devices + local Worker)
 
 `tools/sim/` is a two-ESP32-device simulation with the display: it links the
 *real* `ui.cpp` + `morse.cpp` against host shims and serves two pixel-exact
@@ -182,22 +204,29 @@ Requirements: a C++17 compiler and ImageMagick (`magick`).
 firmware uses (`uiBegin / uiAttach / uiFull / uiPattern / uiResult /
 uiProgress`) with the same input state machine as `main.cpp`.
 
-Each virtual device runs its own relay poller against the **real** relay
-server, so a Morse `SEND` on Dad's panel appears on Emma's panel. The
+Each virtual device runs its own relay poller against the **local Worker
+dev server**, so a Morse `SEND` on Dad's panel appears on Emma's panel. The
 **top-left dot** shows the link state on every screen: red = no WiFi, orange
 = WiFi OK but no relay connection, green = both OK.
 
 ```bash
+make worker-dev          # first: local Worker at http://localhost:8787
 make sim                 # http://localhost:8077/ (PORT_SIM=8080 to change)
 make sim-dump            # headless screenshots -> tools/sim/out/*.ppm
 ./scripts/sim.sh 8077
 ```
 
+The sim is plain HTTP and cannot do TLS, so it talks to the local Worker
+only — never to `https://morse.gulfrenderstudio.com` (an `https://` URL in
+the relay bar reports "sim cannot do TLS"). Test production with `curl`
+(see `worker/README.md`).
+
 Tokens come from the environment (`MORSE_TOKEN_DAD` / `MORSE_TOKEN_EMMA`) or
-the repo-root `.env`, `--dad-token` / `--emma-token` / `--relay=host:port`
-flags, or the relay bar in the page (`POST /api/relay`). If both dots stay
-orange with `auth rejected (401)`, the sim's tokens do not match the relay
-machine's `.env` — paste the relay's tokens into the relay bar and press save.
+the repo-root `.env`, `--dad-token` / `--emma-token` /
+`--relay-url=http://localhost:8787` flags, or the relay bar in the page
+(`POST /api/relay`). If both dots stay orange with `auth rejected (401)`,
+the sim's tokens do not match the local Worker's `.dev.vars` — paste the
+local Worker's tokens into the relay bar and press save.
 
 The web UI shows both framebuffers on `pixelated` canvases, a virtual BOOT
 button per device (pointer + `Space` key on the focused device; tap = dot,
@@ -288,19 +317,23 @@ firmware/
     main.cpp                  input state machine + Arduino entry points
 docs/
   hardware.md                 board, pins, buttons, timing notes
-  messaging-plan.md           WiFi messaging architecture and one-button UX plan
+  messaging-plan.md           original LAN plan (SUPERSEDED in 0.2.0 — history only)
   preview.png                 rendered UI scenes
-server/                       LAN relay (FastAPI + SQLite), see server/README.md
-  app.py                      routes, long-poll notifier
-  config.py / config.toml     settings + device list (no secrets)
-  db.py / auth.py / models.py storage, tokens, request validation
-  tests/                      API + config tests
-  scripts/smoke.sh            end-to-end curl acceptance
+worker/                       Cloudflare Worker + Durable Object relay
+  README.md                   setup, API, free-tier limits, deploy
+  MIGRATION.md                cutover checklist + old laptop-relay cleanup
+  src/index.js                Worker entry: auth, routing, CORS
+  src/morse-do.js             MorseRelay DO: messages, long-poll, ack
+  src/store.js                DO SQLite persistence
+  tests/                      vitest unit + workerd integration tests
+  wrangler.toml               Worker + DO binding (no route — see deploy)
+scripts/
+  init-env.sh                 create .env with random tokens
+  gen-secrets.py              generate firmware/src/secrets.h from .env
+  worker-deploy.sh            deploy the Worker (route from MORSE_SERVER_URL)
 .env.example                  secret template (copy to .env, gitignored)
-scripts/init-env.sh           create .env with random tokens
-scripts/gen-secrets.py        generate firmware/src/secrets.h from .env
 tools/preview/                host shims + scene renderer
 scripts/preview.sh            compile + render + montage
-Makefile                      build / upload / monitor / check / preview
+Makefile                      build / upload / monitor / check / preview / sim / worker-*
 ui.jpeg                       visual reference
 ```

@@ -1,0 +1,26 @@
+# Morse-code Worker — Cloudflare Worker + Durable Object backend.
+#
+# Deploy:  make worker-deploy   (attaches the route from MORSE_SERVER_URL
+#          in the repo-root .env; see scripts/worker-deploy.sh)
+# Local:   make worker-dev      (reads worker/.dev.vars; port 8787)
+#
+# No route is declared here on purpose: the custom-domain route is
+# derived from MORSE_SERVER_URL at deploy time, so the hostname lives in
+# exactly one place (the .env value). `workers_dev = true` keeps the
+# workers.dev URL working for pre-cutover testing.
+name = "morse-code"
+main = "src/index.js"
+compatibility_date = "2026-11-21"
+workers_dev = true
+
+[vars]
+MORSE_DAD_NAME = "DAD"
+MORSE_EMMA_NAME = "EMMA"
+
+[[durable_objects.bindings]]
+name = "MORSE_RELAY"
+class_name = "MorseRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MorseRelay"]

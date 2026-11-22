@@ -7,7 +7,15 @@
 // Two virtual devices (dad + emma) run in this one process. Each has its own
 // input state machine (mirroring firmware/src/main.cpp), its own inbox, and
 // its own relay poller, so a SEND on one panel appears on the other panel via
-// the REAL relay server (default 192.168.4.44:8180, see --relay / .env).
+// the REAL relay — the local Cloudflare Worker dev server by default
+// (MORSE_SERVER_URL=http://localhost:8787, see --relay-url / .env).
+//
+// The sim's HTTP client is plain HTTP over raw sockets: it CANNOT do TLS,
+// so it cannot talk to the production Worker at
+// https://morse.gulfrenderstudio.com. Point the sim at the local Worker
+// (make worker-dev) and test production with curl instead — see
+// worker/README.md. Pointing the sim at an https:// URL reports
+// "sim cannot do TLS" on the link dot instead of silently failing.
 //
 // Link dot (top-left, see UiLink in ui.h):
 //   red    = no WiFi (toggle per device, or no relay configured)
@@ -133,12 +141,53 @@ static uint8_t deviceLink(DeviceSim& d) {
 }
 
 // -----------------------------------------------------------------------------
-// Relay configuration (host/port shared, tokens per device)
+// Relay configuration (one server URL shared, tokens per device)
 // -----------------------------------------------------------------------------
-static std::string g_relayHost = "192.168.4.44";
-static int g_relayPort = 8180;
+// Single URL, not host/port: the relay is the Cloudflare Worker, and the
+// sim talks to the LOCAL Worker dev server over plain HTTP (see the header
+// comment — the sim cannot do TLS, so no https:// URL works here).
+static std::string g_serverUrl = "http://localhost:8787";
 static std::atomic<bool> g_relayEnabled{true};
 static std::atomic<bool> g_running{true};
+
+// Parse "http://host:port[/path]" into host + port. https:// (or anything
+// else) is an error: the sim has no TLS stack. Returns false with `error`
+// set when the URL cannot be used by this sim.
+static bool parseServerUrl(const std::string& url, std::string& host, int& port,
+                           std::string& error) {
+  host.clear();
+  port = 80;
+  error.clear();
+  if (url.rfind("https://", 0) == 0) {
+    error = "sim cannot do TLS: use the local Worker http://localhost:8787 (make worker-dev)";
+    return false;
+  }
+  std::string rest = url;
+  if (rest.rfind("http://", 0) == 0) rest = rest.substr(7);
+  size_t slash = rest.find('/');
+  if (slash != std::string::npos) rest = rest.substr(0, slash);
+  if (rest.empty()) {
+    error = "empty server URL";
+    return false;
+  }
+  size_t colon = rest.rfind(':');
+  if (colon != std::string::npos) {
+    host = rest.substr(0, colon);
+    port = atoi(rest.substr(colon + 1).c_str());
+    if (port < 1 || port > 65535) {
+      error = "bad port in server URL";
+      return false;
+    }
+  } else {
+    host = rest;
+    port = 80;
+  }
+  if (host.empty()) {
+    error = "empty host in server URL";
+    return false;
+  }
+  return true;
+}
 
 static std::string envOr(const char* key, const std::string& dflt) {
   const char* v = getenv(key);
@@ -193,10 +242,7 @@ static void loadRelayConfigFromEnv() {
     if (it != file.end()) return it->second;
     return dflt;
   };
-  g_relayHost = pick("RELAY_HOST", g_relayHost);
-  std::string port = pick("RELAY_PORT", std::to_string(g_relayPort));
-  int p = atoi(port.c_str());
-  if (p >= 1 && p <= 65535) g_relayPort = p;
+  g_serverUrl = pick("MORSE_SERVER_URL", g_serverUrl);
   std::string dad = pick("MORSE_TOKEN_DAD", "");
   std::string emma = pick("MORSE_TOKEN_EMMA", "");
   if (!dad.empty()) {
@@ -214,7 +260,8 @@ static void loadRelayConfigFromEnv() {
 // -----------------------------------------------------------------------------
 static bool httpDo(const std::string& host, int port, const std::string& method,
                    const std::string& path, const std::string& token,
-                   const std::string& body, int& status, std::string& respBody) {
+                   const std::string& body, int& status, std::string& respBody,
+                   int recvTimeoutS = 4) {
   status = 0;
   respBody.clear();
   char portStr[16];
@@ -261,7 +308,7 @@ static bool httpDo(const std::string& host, int port, const std::string& method,
   freeaddrinfo(ai);
   if (fd < 0) return false;
 
-  timeval tv{4, 0};
+  timeval tv{recvTimeoutS, 0};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -484,7 +531,7 @@ static void setLinkLocked(DeviceSim& d, uint8_t link, const std::string& err) {
   d.relayError = err;
 }
 
-static void relayCycleDevice(DeviceSim& d, const std::string& host, int port, bool enabled) {
+static void relayCycleDevice(DeviceSim& d, const std::string& serverUrl, bool enabled) {
   std::string token;
   long long since = 0;
   std::string toSend;
@@ -512,9 +559,12 @@ static void relayCycleDevice(DeviceSim& d, const std::string& host, int port, bo
     setLinkLocked(d, LINK_WIFI, "relay disabled in sim");
     return;
   }
-  if (host.empty()) {
+  std::string host;
+  int port = 80;
+  std::string urlError;
+  if (!parseServerUrl(serverUrl, host, port, urlError)) {
     std::lock_guard<std::mutex> lk(d.mtx);
-    setLinkLocked(d, LINK_WIFI, "no relay host configured");
+    setLinkLocked(d, LINK_WIFI, urlError);
     return;
   }
   if (token.empty()) {
@@ -559,15 +609,19 @@ static void relayCycleDevice(DeviceSim& d, const std::string& host, int port, bo
     }
   }
 
+  // Long-poll wait=20, like the firmware: at wait=0 the sim would burn
+  // ~43,200 requests/day/device against the Workers Free 100,000/day
+  // limit; at wait=20 it is ~4,320/day/device. The recv timeout must
+  // clear the 20 s wait (plus margin) or every poll dies as unreachable.
   std::string path =
-      "/api/v1/messages?since=" + std::to_string(since) + "&wait=0&limit=20";
+      "/api/v1/messages?since=" + std::to_string(since) + "&wait=20&limit=20";
   int st = 0;
   std::string resp;
-  if (!httpDo(host, port, "GET", path, token, "", st, resp)) {
+  if (!httpDo(host, port, "GET", path, token, "", st, resp, 30)) {
     std::lock_guard<std::mutex> lk(d.mtx);
     // Keep a previously-good green until proven otherwise? No: the dot must
     // reflect reality, so a failed poll means orange (wifi ok, relay down).
-    setLinkLocked(d, LINK_WIFI, "relay unreachable: " + host + ":" + std::to_string(port));
+    setLinkLocked(d, LINK_WIFI, "relay unreachable: " + serverUrl);
     return;
   }
   if (st == 401) {
@@ -622,12 +676,11 @@ static void relayLoop() {
   // Stagger so dad and emma do not poll in lockstep.
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
   while (g_running) {
-    std::string host = g_relayHost;
-    int port = g_relayPort;
+    std::string serverUrl = g_serverUrl;
     bool enabled = g_relayEnabled.load();
-    relayCycleDevice(g_dad, host, port, enabled);
+    relayCycleDevice(g_dad, serverUrl, enabled);
     if (!g_running) break;
-    relayCycleDevice(g_emma, host, port, enabled);
+    relayCycleDevice(g_emma, serverUrl, enabled);
     for (int i = 0; i < 20 && g_running; i++)
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
@@ -1332,7 +1385,7 @@ static std::string stateJSON(DeviceSim& d) {
            "\"msgIdx\":%u,\"msgMenu\":%s,\"msgMenuSel\":%u,"
            "\"actionSel\":%u,\"link\":%u,\"linkName\":\"%s\","
            "\"wifi\":%s,\"hasToken\":%s,\"lastSeq\":%lld,"
-           "\"relayHost\":\"%s\",\"relayPort\":%d,"
+           "\"relayUrl\":\"%s\","
            "\"relayError\":\"%s\"}",
            d.id.c_str(), now, d.st.node, letter, d.st.depth, esc.c_str(),
            (d.virtDown || d.inPressed) ? "true" : "false", d.previewState, modeStr,
@@ -1340,7 +1393,7 @@ static std::string stateJSON(DeviceSim& d) {
            d.msgMenuOpen ? "true" : "false", (unsigned)d.msgMenuSel,
            (unsigned)d.actionSel, (unsigned)link, linkName(link),
            wifiOn ? "true" : "false", token.empty() ? "false" : "true",
-           (long long)lastSeq, jsonEscapeC(g_relayHost.c_str()).c_str(), g_relayPort,
+           (long long)lastSeq, jsonEscapeC(g_serverUrl.c_str()).c_str(),
            jsonEscapeC(relayError.c_str()).c_str());
   std::string out(buf);
   // inbox: newest-first [{id,text}]
@@ -1390,8 +1443,8 @@ static std::string relayJSON() {
   };
   char head[512];
   snprintf(head, sizeof(head),
-           "{\"host\":\"%s\",\"port\":%d,\"enabled\":%s,\"dad\":",
-           jsonEscapeC(g_relayHost.c_str()).c_str(), g_relayPort,
+           "{\"url\":\"%s\",\"enabled\":%s,\"dad\":",
+           jsonEscapeC(g_serverUrl.c_str()).c_str(),
            g_relayEnabled.load() ? "true" : "false");
   return std::string(head) + one(g_dad) + ",\"emma\":" + one(g_emma) + "}";
 }
@@ -1605,13 +1658,12 @@ static void handleClient(int fd) {
   }
 
   if (p == "/api/relay" && std::string(method) == "POST") {
-    std::string host, dadToken, emmaToken;
-    long long port = 0;
+    std::string url, dadToken, emmaToken;
     bool enabled = true;
     bool hasEnabled = jsonBoolVal(body, "enabled", enabled);
-    if (jsonStringVal(body, "host", host)) g_relayHost = host;
-    if (jsonIntVal(body, "port", port) && port >= 1 && port <= 65535)
-      g_relayPort = (int)port;
+    // One URL field (the relay bar); "serverUrl" is accepted as an alias.
+    if (jsonStringVal(body, "url", url) && !url.empty()) g_serverUrl = url;
+    else if (jsonStringVal(body, "serverUrl", url) && !url.empty()) g_serverUrl = url;
     if (hasEnabled) g_relayEnabled = enabled;
     if (jsonStringVal(body, "dadToken", dadToken)) {
       std::lock_guard<std::mutex> lk(g_dad.mtx);
@@ -1677,15 +1729,11 @@ int main(int argc, char** argv) {
     if (!strncmp(argv[i], "--port=", 7)) port = atoi(argv[i] + 7);
     if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
     if (!strcmp(argv[i], "--index") && i + 1 < argc) g_indexPath = argv[++i];
-    if (!strncmp(argv[i], "--relay=", 8)) {
-      std::string v = argv[i] + 8;
-      size_t c = v.rfind(':');
-      if (c != std::string::npos) {
-        g_relayHost = v.substr(0, c);
-        g_relayPort = atoi(v.substr(c + 1).c_str());
-      } else {
-        g_relayHost = v;
-      }
+    if (!strncmp(argv[i], "--relay-url=", 12)) {
+      g_serverUrl = argv[i] + 12;
+    }
+    if (!strncmp(argv[i], "--server-url=", 13)) {
+      g_serverUrl = argv[i] + 13;
     }
     if (!strncmp(argv[i], "--dad-token=", 12)) {
       std::lock_guard<std::mutex> lk(g_dad.mtx);
@@ -1770,8 +1818,8 @@ int main(int argc, char** argv) {
   }
   printf("morse-code sim: http://localhost:%d/  (index: %s)\n", port,
          g_indexPath.c_str());
-  printf("relay: %s:%d dad-token:%s emma-token:%s\n", g_relayHost.c_str(),
-         g_relayPort, g_dad.token.empty() ? "MISSING" : "set",
+  printf("relay: %s dad-token:%s emma-token:%s\n", g_serverUrl.c_str(),
+         g_dad.token.empty() ? "MISSING" : "set",
          g_emma.token.empty() ? "MISSING" : "set");
   printf("same renderer as the panel: uiFull/uiPattern/uiResult/uiProgress\n");
   fflush(stdout);

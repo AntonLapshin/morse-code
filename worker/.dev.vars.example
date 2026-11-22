@@ -1,0 +1,9 @@
+# Copy to worker/.dev.vars for local dev (gitignored — never
+# commit real tokens). Generate with:
+#   openssl rand -hex 24
+# The SAME tokens go in the repo-root .env (firmware build) and in
+# `make worker-secrets` for deploys.
+MORSE_TOKEN_DAD=CHANGEME-dad-token-at-least-16-chars-long-000001
+MORSE_TOKEN_EMMA=CHANGEME-emma-token-at-least-16-chars-long-000002
+MORSE_DAD_NAME=DAD
+MORSE_EMMA_NAME=EMMA

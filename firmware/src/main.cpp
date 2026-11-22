@@ -624,8 +624,9 @@ void setup() {
   inPressed    = false;
   preview      = PREVIEW_NONE;
 
-  // Phase 1: WiFi + relay. The net task owns uiSetLink() from here on:
-  // red = no WiFi, orange = WiFi without relay, green = both OK (sim parity).
+  // WiFi + Cloudflare Worker relay (0.2.0). The net task owns uiSetLink()
+  // from here on: red = no WiFi, orange = WiFi without relay, green = both
+  // OK (sim parity).
   netBegin();
   lastLink = LINK_OFF;
   uiFull(st, now);

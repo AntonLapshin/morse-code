@@ -4,6 +4,7 @@ build/
 .vscode/
 tools/preview/build/
 tools/preview/out/
+tools/sim/build/
 *.bin
 *.elf
 *.map
@@ -14,14 +15,20 @@ tools/preview/out/
 .env.*
 !.env.example
 firmware/src/secrets.h
-server/data/
 
-# uv virtualenv / caches
-server/.venv/
-server/.run/
+# Cloudflare Worker local dev (tokens live in .dev.vars, never committed)
+worker/.dev.vars
+worker/.dev.vars.*
+!worker/.dev.vars.example
+worker/node_modules/
+worker/.wrangler/
+worker/dist/
+
+# caches
 .uv-cache/
 __pycache__/
 .pytest_cache/
+node_modules/
 
 # editor / OS noise
 .DS_Store

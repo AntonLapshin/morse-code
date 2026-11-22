@@ -10,15 +10,26 @@
 #   make preview             render the UI to tools/preview/out/preview.png
 #   make sim [PORT=8077]       run the ESP32 display simulator (web UI)
 #   make sim-dump              headless simulator screenshots to tools/sim/out
-#   make start                 start the relay server in the background
-#   make stop                  stop the relay server
-#   make restart               restart the relay server
+#   make worker-dev            local Cloudflare Worker dev server (port 8787)
+#   make worker-test           worker unit + integration tests
+#   make worker-deploy         deploy the Worker (route from MORSE_SERVER_URL)
 #   make clean               remove build + preview output
+#
+# The relay is a Cloudflare Worker + Durable Object — see worker/README.md.
+# There is no laptop server any more: `make start/stop/restart` are gone
+# (deleted in 0.2.0 with server/). The sim talks to the local Worker dev
+# server by default (MORSE_SERVER_URL=http://localhost:8787); run
+# `make worker-dev` in another terminal first.
+#
+# wrangler is a worker devDependency (installed by `make setup` into
+# worker/node_modules/.bin); every wrangler invocation below goes through
+# `npx` from worker/ or a make target — no global install needed. (Or:
+# `cd worker && npx wrangler <cmd>`, or `npm install -g wrangler` if you
+# prefer bare commands.)
+MORSE_SERVER_URL ?= http://localhost:8787
 
 PORT      ?= $(firstword $(wildcard /dev/ttyUSB* /dev/ttyACM*) $(UPLOAD_PORT) /dev/ttyUSB0)
 PORT_SIM  ?= 8077
-RELAY_HOST ?= 0.0.0.0
-RELAY_PORT ?= 8180
 DEVICE    ?= dad
 FQBN      := esp32:esp32:esp32
 SKETCH    := /tmp/morse-code-sketch/morse-code
@@ -29,11 +40,12 @@ SOURCES := firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
            firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h \
            firmware/src/net.cpp firmware/src/net.h
 
-.PHONY: help build upload upload-dad upload-emma monitor check preview sim sim-dump clean stage secrets \
-        start stop restart status
+.PHONY: help setup build upload upload-dad upload-emma monitor check preview sim sim-dump clean stage secrets \
+        worker-dev worker-test worker-deploy worker-secrets worker-logs worker-login test
 
 help:
 	@echo "Targets:"
+	@echo "  make setup                       npm install (worker) + copy .env.example"
 	@echo "  make upload [DEVICE=dad|emma] [PORT=/dev/ttyUSB0]  regen secrets.h, compile + flash"
 	@echo "  make upload-dad [PORT=...]     shortcut for DEVICE=dad"
 	@echo "  make upload-emma [PORT=...]    shortcut for DEVICE=emma"
@@ -41,16 +53,27 @@ help:
 	@echo "  make secrets DEVICE=dad       generate firmware/src/secrets.h from .env"
 	@echo "  make monitor [PORT=...]          serial log @ 115200 baud"
 	@echo "  make check                       verify arduino-cli core/libs + serial port"
-	@echo "  make secrets DEVICE=dad          generate firmware/src/secrets.h from .env"
 	@echo "  make preview                     render UI frames to a PNG (host-side)"
 	@echo "  make sim [PORT=8077]             ESP32 display simulator at http://localhost:8077/"
+	@echo "                                   (talks to the local Worker; run make worker-dev first)"
 	@echo "  make sim-dump                    headless simulator screenshots to tools/sim/out"
-	@echo "  make start [RELAY_PORT=8180]     start the relay server in the background"
-	@echo "  make stop                        stop the relay server"
-	@echo "  make restart                     restart the relay server"
+	@echo "  make worker-dev      local Worker dev server (port 8787)"
+	@echo "  make worker-test     worker unit + integration tests"
+	@echo "  make worker-deploy   deploy the Worker (route from MORSE_SERVER_URL)"
+	@echo "  make worker-secrets  set the production bearer <redacted> (interactive)"
+	@echo "  make worker-logs     tail the deployed Worker logs"
+	@echo "  make worker-login    log wrangler into your Cloudflare account"
+	@echo "  make test            worker unit + integration tests"
 	@echo "  make clean                       remove build + preview output"
 	@echo ""
 	@echo "Current PORT: $(PORT)"
+
+setup:
+	cp -n .env.example .env || true
+	cp -n worker/.dev.vars.example worker/.dev.vars || true
+	npm install --prefix worker
+	@echo "setup done — wrangler $$(./worker/node_modules/.bin/wrangler --version 2>/dev/null || echo '(not found)') is available via make worker-* / cd worker && npx wrangler"
+	@echo "next: fill in .env and worker/.dev.vars, then: make worker-dev"
 
 secrets:
 	./scripts/gen-secrets.py $(DEVICE) --force
@@ -118,9 +141,31 @@ sim-dump:
 	./tools/sim/build/sim --dump tools/sim/out
 	@echo "Wrote tools/sim/out/00-*.ppm (170x320)"
 
-# Relay server: see server/Makefile for the implementation.
-start stop restart status:
-	@$(MAKE) --no-print-directory -C server $@ HOST=$(RELAY_HOST) PORT=$(RELAY_PORT)
+worker-dev:
+	npm run dev --prefix worker
+
+worker-test:
+	npm test --prefix worker
+	npm run test:workers --prefix worker
+
+worker-deploy:
+	bash scripts/worker-deploy.sh
+
+worker-secrets:
+	@echo "Set the production bearer <redacted> (values never printed here)."
+	@echo "You will be prompted for each token; paste the values from .env."
+	cd worker && npx wrangler secret put MORSE_TOKEN_DAD
+	cd worker && npx wrangler secret put MORSE_TOKEN_EMMA
+
+worker-logs:
+	npm run tail --prefix worker
+
+worker-login:
+	cd worker && npx wrangler login
+
+test:
+	npm test --prefix worker
+	npm run test:workers --prefix worker
 
 clean:
 	rm -rf /tmp/morse-code-sketch tools/preview/build tools/preview/out tools/sim/build tools/sim/out
