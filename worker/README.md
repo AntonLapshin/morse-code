@@ -11,7 +11,7 @@ and a longer long-poll wait.
 
 ```
 worker/
-  wrangler.toml          Worker + DO binding (production; no route — see Deploy)
+  wrangler.toml          Worker + DO binding (custom domain comes from .env)
   test-config/
     wrangler.test.toml   test-only config (fake tokens, no route)
   .dev.vars.example      copy to .dev.vars for local dev (gitignored)
@@ -113,12 +113,14 @@ make setup   # installs worker deps, copies .env.example -> .env
              # and worker/.dev.vars.example -> worker/.dev.vars
 ```
 
-Generate tokens with `openssl rand -hex 24` (twice). The SAME tokens
-go in the repo-root `.env` (firmware build), `worker/.dev.vars`
-(local dev), and the Worker secrets (`make worker-secrets`). Put the
-device names in `.env` and `worker/.dev.vars` too
-(`MORSE_DAD_NAME` / `MORSE_EMMA_NAME`) — the deploy passes them to
-the Worker, and local dev reads them from `.dev.vars`.
+Generate two *different* tokens with `openssl rand -hex 24`. The SAME
+tokens go in the repo-root `.env` (firmware build), `worker/.dev.vars`
+(local dev), and the Worker secrets — and `make worker-secrets` pushes
+the `.env` values straight to Cloudflare on stdin, so there is no
+copy-paste step that can make them equal or stale. Put the device names
+in `.env` and `worker/.dev.vars` too (`MORSE_DAD_NAME` /
+`MORSE_EMMA_NAME`) — the deploy passes them to the Worker, and local dev
+reads them from `.dev.vars`.
 
 ## Local dev
 
@@ -157,17 +159,27 @@ as above, not with the sim.
 
 ```bash
 make worker-login     # first time only: authorizes wrangler (opens a browser)
-make worker-secrets   # interactive: sets MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA
-make worker-deploy    # deploys; attaches the route from MORSE_SERVER_URL
+make worker-secrets   # pushes MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA from .env
+make worker-deploy    # deploys; attaches the custom domain from MORSE_SERVER_URL
 ```
 
 `make worker-deploy` runs `scripts/worker-deploy.sh`, which reads
 `MORSE_SERVER_URL` from the repo-root `.env` and passes its host to
-`npx wrangler deploy --route "<host>/*"`. No route is declared in
-`wrangler.toml` — the hostname lives only in that `.env` value.
-Optional `MORSE_WORKER_ZONE` (in `.env` or the environment) is passed as
-`--zone` if route attachment needs an explicit zone. If
-`MORSE_SERVER_URL` is unset, localhost, or a `*.workers.dev` URL, the
+`npx wrangler deploy --domain "<host>"`. No route or domain is declared
+in `wrangler.toml` — the hostname lives only in that `.env` value.
+Cloudflare creates/updates the proxied DNS record and certificate for
+the custom domain, so a fresh deploy works even if the host previously
+pointed at another origin (an old site, a website builder, etc.). Do not
+add a route or DNS entry by hand; routing through `--route` would keep
+the old origin in front and never reach the Worker.
+
+The first deploy that includes `wrangler.toml` also runs the
+`[[migrations]]` entry and creates the `MorseRelay` Durable Object
+namespace. A dashboard / drag-and-drop upload does **not** have the
+migration, so it creates no namespace and the Worker cannot serve
+messages.
+
+If `MORSE_SERVER_URL` is unset, localhost, or a `*.workers.dev` URL, the
 deploy is plain (workers.dev URL only). To validate the deploy without
 deploying or logging in: `bash scripts/worker-deploy.sh --dry-run`.
 
@@ -180,17 +192,27 @@ Workers & Pages → morse-code → Settings → Variables → add
 
 Dashboard half of the deploy (dash.cloudflare.com; also summarized in
 the root README): the custom domain must be a Cloudflare zone (DNS
-managed by Cloudflare). After deploying, check Workers & Pages →
-morse-code for the deployment and version 0.2.0. Settings → Variables
-→ Secrets is the dashboard alternative to `make worker-secrets`;
-Settings → Triggers → Routes is the alternative to the `--route` the
-deploy script passes (add the route there if you deploy without it).
-Observability → Logs (or `make worker-logs`) is where runtime errors
-surface. After the first real request, Workers & Pages → Durable
-Objects lists the `MorseRelay` namespace — a redeploy keeps it, so
-messages survive deploys. If wrangler reports an auth error, run
-`make worker-login` again (or `cd worker && npx wrangler whoami` to
-check who is logged in).
+managed by Cloudflare) in the same account as the Worker. After
+deploying, check Workers & Pages → morse-code for the deployment and
+version 0.2.0, and Workers & Pages → morse-code → Settings → Domains &
+Routes for the custom domain (Cloudflare also shows the DNS record and
+certificate it created). Settings → Variables → Secrets is the dashboard
+alternative to `make worker-secrets`; keep both tokens distinct.
+Workers & Pages → Durable Objects lists the `MorseRelay` namespace after
+the first real deploy — a redeploy keeps it, so messages survive
+deploys. Observability → Logs (or `make worker-logs`) is where runtime
+errors surface. If wrangler reports an auth error, run `make worker-login`
+again (or `cd worker && npx wrangler whoami` to check who is logged in).
+
+### Deploy troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `curl https://<host>/api/v1/health` returns `302 Found` from `openresty` (or another server) | The DNS record still points at an old origin, so Cloudflare never routes to the Worker. Re-run `make worker-deploy` (it uses `--domain`, which rewrites the record) and wait for the custom-domain certificate to become active. |
+| `{"error":"config_error","detail":"...must differ"}` | The two deployed secrets are equal (usually a copy-paste slip). `make worker-secrets` pushes the distinct `.env` values. |
+| `{"error":"config_error","detail":"...must be at least 16 characters"}` | Regenerate both tokens with `openssl rand -hex 24`, update `.env` (and `.dev.vars`), then `make worker-secrets`. |
+| Worker exists but no Durable Object namespace | The script was not deployed with `wrangler.toml` (e.g. dashboard upload). Run `make worker-deploy` from `worker/` with the repo config. |
+| Custom-domain deploy fails with a DNS conflict | Delete the conflicting DNS record for the host in the Cloudflare dashboard (DNS → Records), then re-run `make worker-deploy`; the custom domain recreates it as a proxied record. |
 
 Cutover from the old laptop relay — including deleting the laptop
 server, the systemd unit, and the `ufw` 8180 rule — is a separate

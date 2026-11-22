@@ -12,8 +12,10 @@ slate circuit-tree with circular (dot) and rectangular (dash) nodes, and a
 bright green glow on the node you are currently on.
 
 > **Messaging is live over the internet:** two ESP32s exchange messages
-> through a Cloudflare Worker + Durable Object at
-> `morse.gulfrenderstudio.com` — no laptop server, no open port. See
+> through a Cloudflare Worker + Durable Object at the HTTPS URL in
+> `MORSE_SERVER_URL` (repo-root `.env`) — no laptop server, no open port.
+> `make worker-deploy` attaches that host as a Workers Custom Domain and
+> creates the Durable Object on the first deploy. See
 > [`worker/README.md`](worker/README.md) and the cutover checklist in
 > [`worker/MIGRATION.md`](worker/MIGRATION.md). The original LAN plan is
 > kept as history in [`docs/messaging-plan.md`](docs/messaging-plan.md)
@@ -78,9 +80,26 @@ cutover checklist, including deleting the old laptop relay and its `ufw`
 
 ```bash
 make worker-login       # first time only
-make worker-secrets     # sets MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA as Worker secrets
-make worker-deploy      # attaches the morse.gulfrenderstudio.com route
+make worker-secrets     # pushes MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA from .env
+make worker-deploy      # attaches the custom domain from MORSE_SERVER_URL
 ```
+
+`make worker-deploy` runs `wrangler deploy --domain <host>`, so Cloudflare
+creates/updates the proxied DNS record and certificate itself — do not add a
+route or DNS entry by hand. The first deploy also creates the `MorseRelay`
+Durable Object namespace from the migration in `worker/wrangler.toml`.
+Smoke-test the URL from `.env` without hardcoding the hostname:
+
+```bash
+set -a; . ./.env; set +a
+curl -s "$MORSE_SERVER_URL/api/v1/health"    # {"status":"ok","version":"0.2.0"}
+```
+
+A `302 Found` from `openresty` (or any other origin) means the host still
+resolves to an old website: re-run `make worker-deploy` and wait for the
+custom-domain certificate, then retry. A `500 config_error` saying the tokens
+must differ means the deployed secrets were pasted incorrectly — run
+`make worker-secrets` (it reads the tokens straight from `.env`).
 
 Secrets live in `.env` (gitignored); see
 [`worker/README.md`](worker/README.md) for setup, the API, free-tier
@@ -217,9 +236,9 @@ make sim-dump            # headless screenshots -> tools/sim/out/*.ppm
 ```
 
 The sim is plain HTTP and cannot do TLS, so it talks to the local Worker
-only — never to `https://morse.gulfrenderstudio.com` (an `https://` URL in
-the relay bar reports "sim cannot do TLS"). Test production with `curl`
-(see `worker/README.md`).
+only — never to the production `https://` URL in `MORSE_SERVER_URL` (an
+`https://` URL in the relay bar reports "sim cannot do TLS"). Test
+production with `curl` (see `worker/README.md`).
 
 Tokens come from the environment (`MORSE_TOKEN_DAD` / `MORSE_TOKEN_EMMA`) or
 the repo-root `.env`, `--dad-token` / `--emma-token` /
@@ -303,6 +322,9 @@ letter 'I'  text="E I"
 | Text clears when I press the RESET button | Expected: that button is RESET/EN. Use a `BTN_CLEAR_PIN` button for a software-only clear. |
 | Long dash clears everything | The old ≥ 1.5 s hold-to-clear is now the action menu (`SEND`/`CLEAR`/`READ`); pick `CLEAR` inside it. Shorten `CLEAR_HOLD_MS`/`ACTION_HOLD_MS` only if you really need slower dashes. |
 | Preview fails: `magick: unable to read font` | Install a fontconfig font (`fc-match sans`) or edit `scripts/preview.sh`; the script picks the font file automatically when available. |
+| Custom domain returns `302 Found` / `openresty` | The host still points at the old origin. `make worker-deploy` uses `--domain`, which rewrites the proxied DNS record; re-run it and wait for the certificate. |
+| `/api/v1/health` → `500 config_error` "must differ" | Deployed tokens are wrong/identical. `make worker-secrets` pushes the distinct values from `.env`; re-check with `curl "$MORSE_SERVER_URL/api/v1/health"`. |
+| No Durable Object in the dashboard | Deploy with the repo's `wrangler.toml` (`make worker-deploy`). A dashboard/drag-and-drop upload has no `[[migrations]]`, so no `MorseRelay` namespace is created. |
 
 ## Repository layout
 
@@ -326,11 +348,11 @@ worker/                       Cloudflare Worker + Durable Object relay
   src/morse-do.js             MorseRelay DO: messages, long-poll, ack
   src/store.js                DO SQLite persistence
   tests/                      vitest unit + workerd integration tests
-  wrangler.toml               Worker + DO binding (no route — see deploy)
+  wrangler.toml               Worker + DO binding (custom domain comes from .env)
 scripts/
   init-env.sh                 create .env with random tokens
   gen-secrets.py              generate firmware/src/secrets.h from .env
-  worker-deploy.sh            deploy the Worker (route from MORSE_SERVER_URL)
+  worker-deploy.sh            deploy the Worker (custom domain from MORSE_SERVER_URL)
 .env.example                  secret template (copy to .env, gitignored)
 tools/preview/                host shims + scene renderer
 scripts/preview.sh            compile + render + montage

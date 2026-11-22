@@ -2,11 +2,11 @@
 
 This is the cutover checklist for moving from the old LAN relay
 (FastAPI + SQLite on the Omarchy laptop, port 8180) to the Cloudflare
-Worker + Durable Object at `https://morse.gulfrenderstudio.com`.
+Worker + Durable Object at `https://<your-domain>`.
 The laptop relay is already deleted from this repo (`server/` is gone);
 this file is about cleaning up the laptop itself and re-flashing the
 boards. Do the steps in order — in particular, verify on the
-`workers.dev` URL **before** attaching the custom-domain route, and
+`workers.dev` URL **before** attaching the custom domain, and
 finish or abandon any pending LAN exchange first: **message history
 does NOT migrate**. The DO starts with an empty database and `seq`
 restarts at 1.
@@ -15,20 +15,21 @@ restarts at 1.
 
 - Finish or abandon any in-progress LAN exchange. Anything unread on
   a board, or queued in an outbox, will not appear on the Worker.
-- Confirm the Cloudflare zone for `gulfrenderstudio.com` is DNS-managed
-  by Cloudflare (the route attachment needs it; `chess.gulfrenderstudio.com`
-  already runs on the same zone, so this should already be true).
+- Confirm the Cloudflare zone for the custom domain (the host in
+  `MORSE_SERVER_URL`) is DNS-managed by Cloudflare in the same account as
+  the Worker. `wrangler deploy --domain` needs that zone to create the
+  proxied DNS record and certificate.
 
 ## 1. Deploy the Worker and verify it
 
 ```bash
 make setup            # first time only: installs worker deps, copies .env.example
-$EDITOR .env          # MORSE_SERVER_URL=https://morse.gulfrenderstudio.com,
+$EDITOR .env          # MORSE_SERVER_URL=https://<your-domain>,
                       # WIFI_SSID + WIFI_PASS, MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA
 make worker-login     # first time only
-make worker-secrets   # sets MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA as Worker secrets
+make worker-secrets   # pushes MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA from .env
 bash scripts/worker-deploy.sh --dry-run   # validate without deploying
-make worker-deploy    # deploys; attaches morse.gulfrenderstudio.com/*
+make worker-deploy    # deploys; attaches <your-domain> as a custom domain
 ```
 
 Verify on the `workers.dev` URL **first**, then on the custom domain:
@@ -36,7 +37,7 @@ Verify on the `workers.dev` URL **first**, then on the custom domain:
 ```bash
 curl -s https://morse-code.<your-subdomain>.workers.dev/api/v1/health
 # {"status":"ok","version":"0.2.0"}
-curl -s https://morse.gulfrenderstudio.com/api/v1/health
+curl -s https://<your-domain>/api/v1/health
 # {"status":"ok","version":"0.2.0"}
 ```
 
@@ -44,11 +45,11 @@ Then send one message as dad and poll it as emma (tokens from `.env`):
 
 ```bash
 TOKEN_DAD=...; TOKEN_EMMA=...
-curl -s -X POST https://morse.gulfrenderstudio.com/api/v1/messages \
+curl -s -X POST https://<your-domain>/api/v1/messages \
   -H "Authorization: Bearer $TOKEN_DAD" \
   -H 'Content-Type: application/json' \
   -d '{"client_msg_id":"dad-cutover-1","text":"HELLO"}'
-curl -s -G https://morse.gulfrenderstudio.com/api/v1/messages \
+curl -s -G https://<your-domain>/api/v1/messages \
   -H "Authorization: Bearer $TOKEN_EMMA" \
   --data-urlencode since=0 --data-urlencode wait=5
 # expect the HELLO message, latest_seq 1
@@ -73,7 +74,7 @@ server that no longer exists.
 make upload-dad                          # or: make upload DEVICE=dad
 ./scripts/gen-secrets.py emma --force
 make upload-emma
-make monitor PORT=/dev/ttyUSB0          # expect: net: device=dad server=https://morse.gulfrenderstudio.com ... proto_gen=2
+make monitor PORT=/dev/ttyUSB0          # expect: net: device=dad server=https://<your-domain> ... proto_gen=2
 ```
 
 Check the boot log on each board: the link dot should go green, and a
@@ -144,7 +145,7 @@ and Cloudflare terminates them.
 
 ## 6. Verify the cutover
 
-- [ ] `curl https://morse.gulfrenderstudio.com/api/v1/health` →
+- [ ] `curl https://<your-domain>/api/v1/health` →
       `{"status":"ok","version":"0.2.0"}`
 - [ ] Both boards show a green link dot (not orange/red).
 - [ ] Dad SEND → appears on Emma; Emma SEND → appears on Dad.

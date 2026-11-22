@@ -11,8 +11,8 @@
 // (MORSE_SERVER_URL=http://localhost:8787, see --relay-url / .env).
 //
 // The sim's HTTP client is plain HTTP over raw sockets: it CANNOT do TLS,
-// so it cannot talk to the production Worker at
-// https://morse.gulfrenderstudio.com. Point the sim at the local Worker
+// so it cannot talk to the production Worker at the HTTPS URL in
+// MORSE_SERVER_URL. Point the sim at the local Worker
 // (make worker-dev) and test production with curl instead — see
 // worker/README.md. Pointing the sim at an https:// URL reports
 // "sim cannot do TLS" on the link dot instead of silently failing.

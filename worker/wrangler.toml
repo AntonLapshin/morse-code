@@ -1,13 +1,16 @@
 # Morse-code Worker — Cloudflare Worker + Durable Object backend.
 #
-# Deploy:  make worker-deploy   (attaches the route from MORSE_SERVER_URL
-#          in the repo-root .env; see scripts/worker-deploy.sh)
+# Deploy:  make worker-deploy   (attaches the custom domain from
+#          MORSE_SERVER_URL in the repo-root .env; see
+#          scripts/worker-deploy.sh)
 # Local:   make worker-dev      (reads worker/.dev.vars; port 8787)
 #
-# No route is declared here on purpose: the custom-domain route is
-# derived from MORSE_SERVER_URL at deploy time, so the hostname lives in
-# exactly one place (the .env value). `workers_dev = true` keeps the
-# workers.dev URL working for pre-cutover testing.
+# No route or custom domain is declared here on purpose: the custom domain
+# is derived from MORSE_SERVER_URL at deploy time, so the hostname lives in
+# exactly one place (the .env value). `wrangler deploy --domain <host>`
+# creates/updates the proxied DNS record and certificate too, so the Worker
+# actually receives requests instead of the old origin. `workers_dev = true`
+# keeps the workers.dev URL working for pre-cutover testing.
 name = "morse-code"
 main = "src/index.js"
 compatibility_date = "2026-11-21"

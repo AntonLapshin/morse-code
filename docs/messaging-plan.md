@@ -2,7 +2,7 @@
 
 > **SUPERSEDED in 0.2.0.** The LAN relay described here (FastAPI on the
 > Omarchy laptop, port 8180) was replaced by a Cloudflare Worker +
-> Durable Object at `morse.gulfrenderstudio.com`. The live docs are
+> Durable Object at the HTTPS URL in `MORSE_SERVER_URL`. The live docs are
 > [`worker/README.md`](../worker/README.md) (setup, API, deploy) and
 > [`worker/MIGRATION.md`](../worker/MIGRATION.md) (cutover + laptop
 > cleanup, including the `ufw` 8180 rule). This file is kept as history:

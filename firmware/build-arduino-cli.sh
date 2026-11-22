@@ -11,6 +11,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Never run under sudo: the esp32 core lives in the invoking user's
+# ~/.arduino15, and root would also own the staged /tmp sketch dir.
+if [[ $EUID -eq 0 ]]; then
+  echo "Don't run this with sudo." >&2
+  echo "arduino-cli reads the core from your user's ~/.arduino15, so root sees no esp32 platform;" >&2
+  echo "root would also leave /tmp/morse-code-sketch owned by root and break later builds." >&2
+  echo "Serial access needs the uucp/dialout group, not root: re-run without sudo." >&2
+  exit 1
+fi
+
 FQBN=esp32:esp32:esp32
 SKETCH=/tmp/morse-code-sketch/morse-code
 BUILD=/tmp/morse-code-sketch/build

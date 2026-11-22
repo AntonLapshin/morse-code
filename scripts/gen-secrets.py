@@ -106,7 +106,7 @@ def main() -> int:
             "stale .env: RELAY_HOST/RELAY_PORT were removed in 0.2.0 when the "
             "laptop relay was replaced by the Cloudflare Worker. Delete those "
             "lines and set MORSE_SERVER_URL instead "
-            "(e.g. https://morse.gulfrenderstudio.com, or "
+            "(e.g. https://<your-domain>, or "
             "http://localhost:8787 for local dev)"
         )
 
@@ -125,7 +125,7 @@ def main() -> int:
     if not server_url.startswith(("https://", "http://")):
         raise EnvError(
             f"MORSE_SERVER_URL must be a full URL, got {server_url!r} "
-            "(e.g. https://morse.gulfrenderstudio.com)"
+            "(e.g. https://<your-domain>)"
         )
     server_url = server_url.rstrip("/")
 

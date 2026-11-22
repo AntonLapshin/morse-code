@@ -9,9 +9,9 @@
 // (RX link check + inbox delivery), mirroring tools/sim/sim.cpp behavior.
 //
 // Since 0.2.0 the relay is a Cloudflare Worker + Durable Object
-// (https://morse.gulfrenderstudio.com, see worker/README.md) — no laptop
-// server, no LAN address. SERVER_URL comes from firmware/src/secrets.h,
-// generated from MORSE_SERVER_URL in .env.
+// (SERVER_URL, see worker/README.md) — no laptop server, no LAN address.
+// SERVER_URL comes from firmware/src/secrets.h, generated from
+// MORSE_SERVER_URL in .env.
 //
 // The UI task (`loop()`) owns all rendering/SPI. The net task only calls
 // uiSetLink() and otherwise talks through these queues; `loop()` drains them.

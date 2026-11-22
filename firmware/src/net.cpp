@@ -227,8 +227,8 @@ static size_t parseMessages(const String &body, ParsedMsg *out, size_t cap,
 }
 
 // --- HTTP helpers (net task only) --------------------------------------------
-// HTTPS to the Cloudflare Worker (SERVER_URL, e.g.
-// https://morse.gulfrenderstudio.com). TLS DECISION (0.2.0, deliberate):
+// HTTPS to the Cloudflare Worker (SERVER_URL, the HTTPS URL from
+// MORSE_SERVER_URL in .env). TLS DECISION (0.2.0, deliberate):
 // the client runs with setInsecure() — the certificate chain is NOT
 // verified or pinned. That is the same trust level as the LAN MVP it
 // replaces (plain HTTP on a trusted home WiFi), and it avoids bundling a

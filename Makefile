@@ -12,7 +12,7 @@
 #   make sim-dump              headless simulator screenshots to tools/sim/out
 #   make worker-dev            local Cloudflare Worker dev server (port 8787)
 #   make worker-test           worker unit + integration tests
-#   make worker-deploy         deploy the Worker (route from MORSE_SERVER_URL)
+#   make worker-deploy         deploy the Worker (custom domain from MORSE_SERVER_URL)
 #   make clean               remove build + preview output
 #
 # The relay is a Cloudflare Worker + Durable Object — see worker/README.md.
@@ -41,7 +41,16 @@ SOURCES := firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
            firmware/src/net.cpp firmware/src/net.h
 
 .PHONY: help setup build upload upload-dad upload-emma monitor check preview sim sim-dump clean stage secrets \
-        worker-dev worker-test worker-deploy worker-secrets worker-logs worker-login test
+        guard-not-root worker-dev worker-test worker-deploy worker-secrets worker-logs worker-login test
+
+# Never run build/upload as root: arduino-cli resolves the esp32 core from the
+# invoking user's ~/.arduino15, and root-owned staged files break later builds.
+guard-not-root:
+	@if [ "$$(id -u)" -eq 0 ]; then \
+	  echo "Don't run make with sudo — the esp32 core is installed per-user in ~/.arduino15."; \
+	  echo "Serial access needs the uucp/dialout group, not root."; \
+	  exit 1; \
+	fi
 
 help:
 	@echo "Targets:"
@@ -59,8 +68,8 @@ help:
 	@echo "  make sim-dump                    headless simulator screenshots to tools/sim/out"
 	@echo "  make worker-dev      local Worker dev server (port 8787)"
 	@echo "  make worker-test     worker unit + integration tests"
-	@echo "  make worker-deploy   deploy the Worker (route from MORSE_SERVER_URL)"
-	@echo "  make worker-secrets  set the production bearer <redacted> (interactive)"
+	@echo "  make worker-deploy   deploy the Worker (custom domain from MORSE_SERVER_URL)"
+	@echo "  make worker-secrets  push MORSE_TOKEN_DAD/EMMA from .env as Worker secrets"
 	@echo "  make worker-logs     tail the deployed Worker logs"
 	@echo "  make worker-login    log wrangler into your Cloudflare account"
 	@echo "  make test            worker unit + integration tests"
@@ -102,14 +111,14 @@ stage:
 	@printf '// morse-code sketch - real sources live in main.cpp / ui.cpp / morse.cpp\n' \
 	    > $(SKETCH)/morse-code.ino
 
-build: secrets stage
+build: guard-not-root secrets stage
 	@if [ ! -f firmware/src/secrets.h ]; then \
 	  echo "firmware/src/secrets.h missing. Run: make secrets DEVICE=$(DEVICE)"; \
 	  exit 1; \
 	fi
 	arduino-cli compile --fqbn $(FQBN) --output-dir $(BUILD_DIR) $(SKETCH)
 
-upload: secrets stage
+upload: guard-not-root secrets stage
 	@if [ ! -e "$(PORT)" ]; then \
 	  echo "No serial port at $(PORT). Plug in via USB data cable, then: ls /dev/ttyUSB* /dev/ttyACM*"; \
 	  exit 1; \
@@ -151,11 +160,25 @@ worker-test:
 worker-deploy:
 	bash scripts/worker-deploy.sh
 
+# Push the tokens straight from .env, so the deployed secrets cannot drift
+# from the values the firmware/sim use (a copy-paste slip that set both to the
+# same value made every request fail with 500 config_error). Values are piped
+# to wrangler on stdin and never echoed.
 worker-secrets:
-	@echo "Set the production bearer <redacted> (values never printed here)."
-	@echo "You will be prompted for each token; paste the values from .env."
-	cd worker && npx wrangler secret put MORSE_TOKEN_DAD
-	cd worker && npx wrangler secret put MORSE_TOKEN_EMMA
+	@set -a; . ./.env; set +a; \
+	: "$${MORSE_TOKEN_DAD:?MORSE_TOKEN_DAD is missing from .env}"; \
+	: "$${MORSE_TOKEN_EMMA:?MORSE_TOKEN_EMMA is missing from .env}"; \
+	if [ "$$MORSE_TOKEN_DAD" = "$$MORSE_TOKEN_EMMA" ]; then \
+	  echo "worker-secrets: MORSE_TOKEN_DAD and MORSE_TOKEN_EMMA must differ in .env"; \
+	  exit 1; \
+	fi; \
+	if [ $${#MORSE_TOKEN_DAD} -lt 16 ] || [ $${#MORSE_TOKEN_EMMA} -lt 16 ]; then \
+	  echo "worker-secrets: tokens must be at least 16 characters (use: openssl rand -hex 24)"; \
+	  exit 1; \
+	fi; \
+	cd worker && \
+	printf '%s' "$$MORSE_TOKEN_DAD" | npx wrangler secret put MORSE_TOKEN_DAD && \
+	printf '%s' "$$MORSE_TOKEN_EMMA" | npx wrangler secret put MORSE_TOKEN_EMMA
 
 worker-logs:
 	npm run tail --prefix worker
