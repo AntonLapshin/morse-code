@@ -14,12 +14,8 @@ bright green glow on the node you are currently on.
 > **Messaging is live over the internet:** two ESP32s exchange messages
 > through a Cloudflare Worker + Durable Object at the HTTPS URL in
 > `MORSE_SERVER_URL` (repo-root `.env`) — no laptop server, no open port.
-> `make worker-deploy` attaches that host as a Workers Custom Domain and
-> creates the Durable Object on the first deploy. See
-> [`worker/README.md`](worker/README.md) and the cutover checklist in
-> [`worker/MIGRATION.md`](worker/MIGRATION.md). The original LAN plan is
-> kept as history in [`docs/messaging-plan.md`](docs/messaging-plan.md)
-> (marked superseded there).
+> See [`worker/README.md`](worker/README.md) and the cutover checklist in
+> [`worker/MIGRATION.md`](worker/MIGRATION.md).
 
 ## Controls
 
@@ -39,6 +35,9 @@ The board has two physical buttons: **BOOT** (GPIO0) and **RESET/EN**.
 
 The **top-left dot** is the link indicator on every screen: red = no WiFi
 connection, orange = WiFi OK but no connection to the relay, green = both OK.
+The **top-right** shows this device's name (`DAD` / `EMMA`, from
+`DEVICE_NAME` in `secrets.h`) and, when there are unread messages, the
+`N NEW` badge to its left.
 (The dot is live on both the board and the sim: red while WiFi connects,
 orange when WiFi is up but the relay is unreachable, green once the relay
 answers. An `AUTH ERR` toast after `SEND` means the device token in `.env`
@@ -61,59 +60,20 @@ example `27`). See [`docs/hardware.md`](docs/hardware.md).
 
 The relay is a Cloudflare Worker + Durable Object in [`worker/`](worker/README.md).
 The firmware joins the WiFi, POSTs outbound messages to it over HTTPS, and
-long-polls it (20 s wait) for link status and inbound messages; the sim
+long-polls it (5 s wait) for link status and inbound messages; the sim
 exercises the same path from the host against the *local* Worker dev server.
 No laptop needs to run, no port is open, and the boards work from anywhere
 with internet — including Emma's place, not just the home LAN.
 
-```bash
-./scripts/init-env.sh   # first run: creates .env with fresh tokens, chmod 600
-$EDITOR .env            # set WIFI_SSID + WIFI_PASS, check MORSE_SERVER_URL
-make setup              # installs worker deps, copies worker/.dev.vars.example
-make worker-dev         # local Worker at http://localhost:8787
-make worker-test        # worker unit + integration tests
-```
-
-Deploying (see [`worker/MIGRATION.md`](worker/MIGRATION.md) for the full
-cutover checklist, including deleting the old laptop relay and its `ufw`
-8180 rule — history does NOT migrate, and both boards must be re-flashed):
-
-```bash
-make worker-login       # first time only
-make worker-secrets     # pushes MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA from .env
-make worker-deploy      # attaches the custom domain from MORSE_SERVER_URL
-```
-
-`make worker-deploy` runs `wrangler deploy --domain <host>`, so Cloudflare
-creates/updates the proxied DNS record and certificate itself — do not add a
-route or DNS entry by hand. The first deploy also creates the `MorseRelay`
-Durable Object namespace from the migration in `worker/wrangler.toml`.
-Smoke-test the URL from `.env` without hardcoding the hostname:
-
-```bash
-set -a; . ./.env; set +a
-curl -s "$MORSE_SERVER_URL/api/v1/health"    # {"status":"ok","version":"0.2.0"}
-```
-
-A `302 Found` from `openresty` (or any other origin) means the host still
-resolves to an old website: re-run `make worker-deploy` and wait for the
-custom-domain certificate, then retry. A `500 config_error` saying the tokens
-must differ means the deployed secrets were pasted incorrectly — run
-`make worker-secrets` (it reads the tokens straight from `.env`).
-
-Secrets live in `.env` (gitignored); see
-[`worker/README.md`](worker/README.md) for setup, the API, free-tier
-limits, and the curl smoke test. One deliberate trade-off to know about:
-the ESP32 uses `WiFiClientSecure` with `setInsecure()` in 0.2.0 — the
-certificate chain is not verified or pinned (see the comment in
-`firmware/src/net.cpp`); pinning the Cloudflare CA is a TODO.
-
-Flashing a board copies its slice of `.env` into the firmware:
-
-```bash
-./scripts/gen-secrets.py dad    # then make upload, or:
-./firmware/build-arduino-cli.sh --device dad --upload /dev/ttyUSB0
-```
+Setup → local test → deploy → verify is one flow in
+[`worker/README.md`](worker/README.md#setup) (tokens, local dev server,
+smoke test, deploy, free-tier limits, TLS note, troubleshooting). Coming
+from the old laptop relay, follow the cutover checklist in
+[`worker/MIGRATION.md`](worker/MIGRATION.md) instead — history does NOT
+migrate, and both boards must be re-flashed. One deliberate trade-off to
+know about: the ESP32 uses `WiFiClientSecure` with `setInsecure()` in
+0.2.0 — the certificate chain is not verified or pinned (see the comment
+in `firmware/src/net.cpp`); pinning the Cloudflare CA is a TODO.
 
 Re-flashing after the 0.2.0 cutover is required, not optional: the DO
 starts with an empty database and `seq` restarts at 1, so a board that
@@ -159,7 +119,7 @@ arduino-cli lib install "Adafruit ST7735 and ST7789 Library" "Adafruit GFX Libra
 Then:
 
 ```bash
-make check                        # toolchain + /dev/ttyUSB0 sanity check
+make check                        # full readiness check — run first when something breaks (toolchain, .env, Worker health)
 make build DEVICE=dad             # compile only (needs secrets.h, see below)
 make upload-dad PORT=/dev/ttyUSB0 # regen dad secrets.h, compile + flash
 make upload-emma PORT=/dev/ttyUSB0
@@ -227,7 +187,10 @@ uiProgress`) with the same input state machine as `main.cpp`.
 Each virtual device runs its own relay poller against the **local Worker
 dev server**, so a Morse `SEND` on Dad's panel appears on Emma's panel. The
 **top-left dot** shows the link state on every screen: red = no WiFi, orange
-= WiFi OK but no relay connection, green = both OK.
+= WiFi OK but no relay connection, green = both OK; the **top-right** shows
+the device name (`DAD` / `EMMA`). The sim polls in 2 s slices so a queued
+`SEND` goes out within ~2 s (the firmware's single-task 5 s wait is the
+same trade-off with a longer slice — see `firmware/src/config.h`).
 
 ```bash
 make worker-dev          # first: local Worker at http://localhost:8787
@@ -323,11 +286,9 @@ letter 'I'  text="E I"
 | Text clears when I press the RESET button | Expected: that button is RESET/EN. Use a `BTN_CLEAR_PIN` button for a software-only clear. |
 | Long dash clears everything | The old ≥ 1.5 s hold-to-clear is now the action menu (`SEND`/`CLEAR`/`READ`); pick `CLEAR` inside it. Shorten `CLEAR_HOLD_MS`/`ACTION_HOLD_MS` only if you really need slower dashes. |
 | Preview fails: `magick: unable to read font` | Install a fontconfig font (`fc-match sans`) or edit `scripts/preview.sh`; the script picks the font file automatically when available. |
-| Custom domain returns `302 Found` / `openresty` | The host still points at the old origin. `make worker-deploy` uses `--domain`, which rewrites the proxied DNS record; re-run it and wait for the certificate. |
-| `/api/v1/health` → `500 config_error` "must differ" | Deployed tokens are wrong/identical. `make worker-secrets` pushes the distinct values from `.env`; re-check with `curl "$MORSE_SERVER_URL/api/v1/health"`. |
-| No Durable Object in the dashboard | Deploy with the repo's `wrangler.toml` (`make worker-deploy`). A dashboard/drag-and-drop upload has no `[[migrations]]`, so no `MorseRelay` namespace is created. |
+| Custom domain returns `302 Found` / `openresty`, `/api/v1/health` → `500 config_error`, or no Durable Object in the dashboard | Worker/deploy problem — see the troubleshooting table in [`worker/README.md`](worker/README.md#deploy-troubleshooting). |
 | Dot stays orange ~20 s after WiFi connects | Old firmware: the first poll used the full 20 s long-poll. Current firmware sends the first poll with `wait=0`, so the dot turns green within a few seconds of WiFi. Re-flash both boards. |
-| `QUEUED` → `SENT` takes up to ~20 s | By design on the ESP32: one network task shares the 20 s long-poll (two TLS tasks do not fit next to the 108 KB canvas in 320 KB RAM), so a SEND queued mid-poll waits for that poll. Random 1–20 s is the wait remainder, not a failure. |
+| `QUEUED` → `SENT` takes up to ~5 s | By design on the ESP32: one network task shares the 5 s long-poll (two TLS tasks do not fit next to the 108 KB canvas in 320 KB RAM), so a SEND queued mid-poll waits for that poll. Typically ~2.5 s, never more than 5 s — not a failure. |
 | Peer messages never arrive (badge stays empty) | Old firmware advanced `last_seq` to its own send's `seq`, skipping lower-numbered peer messages. Fixed: sends never move `last_seq`; the RX poll advances past them via `latest_seq`. Re-flash **both** boards — `MORSE_PROTO_GEN = 3` resets `last_seq` to 0 once, recovering anything skipped. |
 | Inbox empty after a reboot | Fixed: the inbox (up to 8 messages) is now persisted in NVS and restored on boot; new arrivals auto-open when the board is idle in COMPOSE. |
 
@@ -344,10 +305,9 @@ firmware/
     main.cpp                  input state machine + Arduino entry points
 docs/
   hardware.md                 board, pins, buttons, timing notes
-  messaging-plan.md           original LAN plan (SUPERSEDED in 0.2.0 — history only)
   preview.png                 rendered UI scenes
 worker/                       Cloudflare Worker + Durable Object relay
-  README.md                   setup, API, free-tier limits, deploy
+  README.md                   setup, API, free-tier limits, deploy — the one flow
   MIGRATION.md                cutover checklist + old laptop-relay cleanup
   src/index.js                Worker entry: auth, routing, CORS
   src/morse-do.js             MorseRelay DO: messages, long-poll, ack
@@ -357,6 +317,7 @@ worker/                       Cloudflare Worker + Durable Object relay
 scripts/
   init-env.sh                 create .env with random tokens
   gen-secrets.py              generate firmware/src/secrets.h from .env
+  check.sh                    `make check` — full readiness check
   worker-deploy.sh            deploy the Worker (custom domain from MORSE_SERVER_URL)
 .env.example                  secret template (copy to .env, gitignored)
 tools/preview/                host shims + scene renderer

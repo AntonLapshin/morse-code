@@ -22,48 +22,24 @@ restarts at 1.
 
 ## 1. Deploy the Worker and verify it
 
-```bash
-make setup            # first time only: installs worker deps, copies .env.example
-$EDITOR .env          # MORSE_SERVER_URL=https://<your-domain>,
-                      # WIFI_SSID + WIFI_PASS, MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA
-make worker-login     # first time only
-make worker-secrets   # pushes MORSE_TOKEN_DAD / MORSE_TOKEN_EMMA from .env
-bash scripts/worker-deploy.sh --dry-run   # validate without deploying
-make worker-deploy    # deploys; attaches <your-domain> as a custom domain
-```
-
-Verify on the `workers.dev` URL **first**, then on the custom domain:
-
-```bash
-curl -s https://morse-code.<your-subdomain>.workers.dev/api/v1/health
-# {"status":"ok","version":"0.2.0"}
-curl -s https://<your-domain>/api/v1/health
-# {"status":"ok","version":"0.2.0"}
-```
-
-Then send one message as dad and poll it as emma (tokens from `.env`):
-
-```bash
-TOKEN_DAD=...; TOKEN_EMMA=...
-curl -s -X POST https://<your-domain>/api/v1/messages \
-  -H "Authorization: Bearer $TOKEN_DAD" \
-  -H 'Content-Type: application/json' \
-  -d '{"client_msg_id":"dad-cutover-1","text":"HELLO"}'
-curl -s -G https://<your-domain>/api/v1/messages \
-  -H "Authorization: Bearer $TOKEN_EMMA" \
-  --data-urlencode since=0 --data-urlencode wait=5
-# expect the HELLO message, latest_seq 1
-```
+Follow the one flow in [`worker/README.md`](README.md#setup) — setup,
+local test, `make worker-secrets`, `make worker-deploy` — then verify on
+the `workers.dev` URL **first**, then on the custom domain, and send one
+test message as dad and poll it as emma. The commands are the smoke test
+in `worker/README.md` ("Local dev" and "Deploy + cutover"), run against
+the deployed URLs instead of `localhost:8787`: the health check must
+answer `{"status":"ok","version":"0.2.0"}` on both URLs, and the emma
+poll must return the HELLO message with `latest_seq` 1.
 
 If any of that fails, stop here — do not touch the laptop relay yet.
 
 ## 2. Re-flash both boards (required)
 
 The firmware now talks HTTPS to `MORSE_SERVER_URL` and polls with
-`wait=20`. More importantly, the DO's `seq` restarts at 1, so a board
+`wait=5`. More importantly, the DO's `seq` restarts at 1, so a board
 that kept its LAN-era `last_seq` (e.g. 42) would poll `since=42` and
 ignore every new message forever. The firmware handles this with a
-`proto_gen` NVS key (`MORSE_PROTO_GEN = 2` in `firmware/src/config.h`):
+`proto_gen` NVS key (`MORSE_PROTO_GEN = 3` in `firmware/src/config.h`):
 on first boot after the re-flash it sees the generation mismatch and
 resets `last_seq` to 0. That reset only happens if you actually
 re-flash — a board still running the LAN firmware keeps talking to a
@@ -74,19 +50,20 @@ server that no longer exists.
 make upload-dad                          # or: make upload DEVICE=dad
 ./scripts/gen-secrets.py emma --force
 make upload-emma
-make monitor PORT=/dev/ttyUSB0          # expect: net: device=dad server=https://<your-domain> ... proto_gen=2
+make monitor PORT=/dev/ttyUSB0          # expect: net: device=dad server=https://<your-domain> ... proto_gen=3
 ```
 
 Check the boot log on each board: the link dot should go green, and a
-test SEND from one board should appear on the other within ~20 s
-(the long-poll wait; usually much faster).
+test SEND from one board should appear on the other within ~5 s
+(the long-poll wait; usually much faster — the DO wakes the poll the
+moment a message lands).
 
 ## 3. Stop the laptop relay
 
 On the Omarchy laptop, in the repo checkout:
 
 ```bash
-# If the systemd user unit was enabled (see docs/messaging-plan.md §6.8):
+# If the systemd user unit was enabled:
 systemctl --user stop --now morse-relay
 systemctl --user disable morse-relay
 rm -f ~/.config/systemd/user/morse-relay.service

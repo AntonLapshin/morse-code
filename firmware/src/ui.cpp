@@ -71,6 +71,22 @@ static void drawLinkDot() {
   gfx->fillCircle(10, 7, 4, c);
 }
 
+// Device name for the top-right corner (uiSetDeviceName). Stored truncated
+// so a long Worker var name can never run into the link dot.
+#define DEVICE_NAME_MAX 12
+static char s_deviceName[DEVICE_NAME_MAX + 1] = {0};
+
+void uiSetDeviceName(const char* name) {
+  if (!name) {
+    s_deviceName[0] = '\0';
+    return;
+  }
+  size_t n = strlen(name);
+  if (n > DEVICE_NAME_MAX) n = DEVICE_NAME_MAX;
+  memcpy(s_deviceName, name, n);
+  s_deviceName[n] = '\0';
+}
+
 // -----------------------------------------------------------------------------
 // Text helpers
 // -----------------------------------------------------------------------------
@@ -98,6 +114,19 @@ static void centeredText(const char* s, int y, uint8_t size, uint16_t fg,
                          uint16_t bg, uint8_t spacing = 0) {
   int w = textAdvance(s, size, spacing);
   drawText(s, (SCREEN_W - w) / 2, y, size, fg, bg, spacing);
+}
+
+// Draw the name right-aligned ending at SCREEN_W-8, size 1, at the given
+// y (3 in the badge strip, 6 in the message card — matching the text next
+// to it). Returns the x where the name starts (SCREEN_W-8 when no name is
+// set), so the badge / page counter can sit left of it with a gap.
+static int drawDeviceName(int y) {
+  if (!gfx || s_deviceName[0] == '\0') return SCREEN_W - 8;
+  int w = textAdvance(s_deviceName, 1, 0);
+  int x = SCREEN_W - 8 - w;
+  if (x < 20) x = 20; // never overwrite the link dot
+  drawText(s_deviceName, x, y, 1, COL_LABEL, COL_BG);
+  return x;
 }
 
 // -----------------------------------------------------------------------------
@@ -227,11 +256,6 @@ static void drawTree(const MorseState& st, uint32_t now) {
 // -----------------------------------------------------------------------------
 static void drawPattern(const MorseState& st, uint8_t preview, uint32_t now) {
   gfx->fillRect(0, PATTERN_TOP, SCREEN_W, PATTERN_H, COL_BG);
-
-  if (preview == PREVIEW_CLEAR) {
-    centeredText("CLEAR", PATTERN_TOP, 1, COL_RED, COL_BG);
-    return;
-  }
 
   if (preview == PREVIEW_ACTIONS) {
     centeredText("MENU", PATTERN_TOP, 1, COL_YELLOW, COL_BG);
@@ -534,6 +558,7 @@ void uiBadge(uint8_t unread, uint32_t now) {
   if (!gfx) return;
   gfx->fillRect(0, 0, SCREEN_W, 14, COL_BG);
   drawLinkDot();
+  int nameX = drawDeviceName(3);
   if (unread == 0) {
     flushRect(0, 14);
     return;
@@ -541,7 +566,9 @@ void uiBadge(uint8_t unread, uint32_t now) {
   char buf[16];
   snprintf(buf, sizeof(buf), "%u NEW", unread);
   int w = textAdvance(buf, 1, 0);
-  int x = SCREEN_W - w - 8;
+  // Badge sits left of the device name, red dot ahead of the text.
+  int x = nameX - 10 - w;
+  if (x < 20) x = 20; // never overwrite the link dot
   gfx->fillCircle(x - 6, 6, 4, COL_RED);
   drawText(buf, x, 3, 1, COL_WHITE, COL_BG);
   flushRect(0, 14);
@@ -603,13 +630,15 @@ void uiMessageCard(uint32_t id, const char* text, uint8_t index1, uint8_t total,
   char left[20];
   snprintf(left, sizeof(left), "MSG #%u", (unsigned)id);
   drawText(left, 18, 6, 1, COL_TITLE, COL_BG);
+  int nameX = drawDeviceName(6);
   char right[16];
   if (total > 0)
     snprintf(right, sizeof(right), "%u/%u", index1, total);
   else
     snprintf(right, sizeof(right), "0/0");
   int rw = textAdvance(right, 1, 0);
-  drawText(right, SCREEN_W - rw - 8, 6, 1, COL_HINT, COL_BG);
+  // Page counter sits left of the device name.
+  drawText(right, nameX - 8 - rw, 6, 1, COL_HINT, COL_BG);
   gfx->fillRect(0, 20, SCREEN_W, 1, COL_DIVIDER);
 
   char lines[10][26];

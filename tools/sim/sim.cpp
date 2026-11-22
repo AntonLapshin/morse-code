@@ -133,6 +133,11 @@ static DeviceSim* devById(const std::string& id) {
 static void selectDevice(DeviceSim& d, uint8_t link) {
   uiAttach(&d.display);
   uiSetLink(link);
+  // The on-screen name is the device id, upper-cased ("DAD" / "EMMA") —
+  // the same value gen-secrets.py writes as DEVICE_NAME for the firmware.
+  std::string upper = d.id;
+  for (char& c : upper) c = (char)toupper((unsigned char)c);
+  uiSetDeviceName(upper.c_str());
 }
 
 static uint8_t deviceLink(DeviceSim& d) {
@@ -531,108 +536,109 @@ static void setLinkLocked(DeviceSim& d, uint8_t link, const std::string& err) {
   d.relayError = err;
 }
 
-static void relayCycleDevice(DeviceSim& d, const std::string& serverUrl, bool enabled) {
+// -----------------------------------------------------------------------------
+// Relay poll threads: one per device (TX flush + RX poll slices + ack)
+// -----------------------------------------------------------------------------
+// One thread per device. The old single thread polled dad then emma in
+// sequence, so with a 20 s wait each device only polled every ~40 s —
+// inside the 45 s presence window, so peer_online flapped in the sim.
+// Separate threads keep each device on its own ~20 s cycle.
+
+// Flush one queued outbound message (Morse SEND or web send button).
+// Returns false when the send failed (link already updated, caller
+// returns); true when nothing was queued or the POST went out (200/201).
+static bool tryFlushSend(DeviceSim& d, const std::string& host, int port) {
   std::string token;
-  long long since = 0;
   std::string toSend;
   uint64_t counter = 0;
-  bool wifiOn = true;
   {
     std::lock_guard<std::mutex> lk(d.mtx);
     token = d.token;
-    since = d.lastSeq;
-    wifiOn = d.wifiOn;
     if (!d.pendingSend.empty()) {
       toSend = d.pendingSend;
       counter = d.sendCounter;
       d.pendingSend.clear();
     }
   }
+  if (toSend.empty()) return true;
 
-  if (!wifiOn) {
-    std::lock_guard<std::mutex> lk(d.mtx);
-    setLinkLocked(d, LINK_OFF, "wifi off (sim toggle)");
-    return;
-  }
-  if (!enabled) {
-    std::lock_guard<std::mutex> lk(d.mtx);
-    setLinkLocked(d, LINK_WIFI, "relay disabled in sim");
-    return;
-  }
-  std::string host;
-  int port = 80;
-  std::string urlError;
-  if (!parseServerUrl(serverUrl, host, port, urlError)) {
-    std::lock_guard<std::mutex> lk(d.mtx);
-    setLinkLocked(d, LINK_WIFI, urlError);
-    return;
-  }
-  if (token.empty()) {
-    std::lock_guard<std::mutex> lk(d.mtx);
-    setLinkLocked(d, LINK_WIFI, "no token: set MORSE_TOKEN_" + d.id + " or use the relay bar");
-    return;
-  }
-
-  // Flush one queued outbound message first (Morse SEND or web send button).
-  if (!toSend.empty()) {
-    char cid[64];
-    snprintf(cid, sizeof(cid), "%s-sim-%llu", d.id.c_str(),
-             (unsigned long long)counter);
-    std::string payload = std::string("{\"client_msg_id\":\"") + cid +
-                          "\",\"to\":\"family\",\"text\":\"" + jsonEscapeStr(toSend) + "\"}";
-    int st = 0;
-    std::string resp;
-    if (!httpDo(host, port, "POST", "/api/v1/messages", token, payload, st, resp)) {
-      std::lock_guard<std::mutex> lk(d.mtx);
-      // Requeue once so a momentary drop does not eat the message.
-      if (d.pendingSend.empty()) {
-        d.pendingSend = toSend;
-      }
-      setLinkLocked(d, LINK_WIFI, "relay unreachable (send)");
-      return;
-    }
-    if (st == 401) {
-      std::lock_guard<std::mutex> lk(d.mtx);
-      setLinkLocked(d, LINK_WIFI, "auth rejected (401): token mismatch with relay .env?");
-      return;
-    }
-    if (st != 200 && st != 201) {
-      std::lock_guard<std::mutex> lk(d.mtx);
-      setLinkLocked(d, LINK_WIFI, "send rejected: HTTP " + std::to_string(st));
-      return;
-    }
-    long long seq = 0;
-    jsonIntVal(resp, "seq", seq);
-    if (seq > 0) {
-      std::lock_guard<std::mutex> lk(d.mtx);
-      if (seq > d.lastSeq) d.lastSeq = seq;
-    }
-  }
-
-  // Long-poll wait=20, like the firmware: at wait=0 the sim would burn
-  // ~43,200 requests/day/device against the Workers Free 100,000/day
-  // limit; at wait=20 it is ~4,320/day/device. The recv timeout must
-  // clear the 20 s wait (plus margin) or every poll dies as unreachable.
-  std::string path =
-      "/api/v1/messages?since=" + std::to_string(since) + "&wait=20&limit=20";
+  char cid[64];
+  // Per-process boot id, like the firmware's <device>-<bootId>-<counter>:
+  // without it a sim restart reuses dad-sim-1..N and the relay answers
+  // 200 duplicate for the previous run's messages instead of storing the
+  // new text.
+  static const uint32_t bootId = [] {
+    uint32_t b = (uint32_t)std::chrono::steady_clock::now()
+                     .time_since_epoch()
+                     .count();
+    return b != 0 ? b : 1u;
+  }();
+  snprintf(cid, sizeof(cid), "%s-sim-%04x-%llu", d.id.c_str(),
+           (unsigned)bootId, (unsigned long long)counter);
+  std::string payload = std::string("{\"client_msg_id\":\"") + cid +
+                        "\",\"to\":\"family\",\"text\":\"" + jsonEscapeStr(toSend) + "\"}";
   int st = 0;
   std::string resp;
-  if (!httpDo(host, port, "GET", path, token, "", st, resp, 30)) {
+  if (!httpDo(host, port, "POST", "/api/v1/messages", token, payload, st, resp)) {
     std::lock_guard<std::mutex> lk(d.mtx);
-    // Keep a previously-good green until proven otherwise? No: the dot must
-    // reflect reality, so a failed poll means orange (wifi ok, relay down).
-    setLinkLocked(d, LINK_WIFI, "relay unreachable: " + serverUrl);
-    return;
+    // Requeue once so a momentary drop does not eat the message.
+    if (d.pendingSend.empty()) {
+      d.pendingSend = toSend;
+    }
+    setLinkLocked(d, LINK_WIFI, "relay unreachable (send)");
+    return false;
   }
   if (st == 401) {
     std::lock_guard<std::mutex> lk(d.mtx);
     setLinkLocked(d, LINK_WIFI, "auth rejected (401): token mismatch with relay .env?");
-    return;
+    return false;
+  }
+  if (st != 200 && st != 201) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "send rejected: HTTP " + std::to_string(st));
+    return false;
+  }
+  // Do NOT advance lastSeq from the POST response. That was the firmware
+  // 0.2.0 TX bug (fixed there by MORSE_PROTO_GEN=3): a send assigned seq N
+  // would make the next poll since=N skip a peer message with seq < N that
+  // had not been fetched yet. The RX poll below advances past our own
+  // sends via latest_seq instead.
+  return true;
+}
+
+// One long-poll slice (waitS seconds) + ack. Returns false on transport /
+// auth / HTTP failure (link already updated, caller returns).
+static bool pollSlice(DeviceSim& d, const std::string& host, int port, int waitS) {
+  std::string token;
+  long long since = 0;
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    token = d.token;
+    since = d.lastSeq;
+  }
+
+  std::string path = "/api/v1/messages?since=" + std::to_string(since) +
+                     "&wait=" + std::to_string(waitS) + "&limit=20";
+  int st = 0;
+  std::string resp;
+  // The recv timeout must clear the wait (plus margin) or every poll dies
+  // as unreachable.
+  if (!httpDo(host, port, "GET", path, token, "", st, resp, waitS + 10)) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    // Keep a previously-good green until proven otherwise? No: the dot must
+    // reflect reality, so a failed poll means orange (wifi ok, relay down).
+    setLinkLocked(d, LINK_WIFI, "relay unreachable: " + g_serverUrl);
+    return false;
+  }
+  if (st == 401) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "auth rejected (401): token mismatch with relay .env?");
+    return false;
   }
   if (st != 200) {
     std::lock_guard<std::mutex> lk(d.mtx);
     setLinkLocked(d, LINK_WIFI, "poll HTTP " + std::to_string(st));
-    return;
+    return false;
   }
 
   long long latest = since;
@@ -661,7 +667,7 @@ static void relayCycleDevice(DeviceSim& d, const std::string& serverUrl, bool en
   {
     std::lock_guard<std::mutex> lk(d.mtx);
     upto = d.lastSeq;
-    if (upto <= d.ackedSeq) return;
+    if (upto <= d.ackedSeq) return true;
   }
   int ast = 0;
   std::string aresp;
@@ -670,19 +676,69 @@ static void relayCycleDevice(DeviceSim& d, const std::string& serverUrl, bool en
     std::lock_guard<std::mutex> lk(d.mtx);
     if (upto > d.ackedSeq) d.ackedSeq = upto;
   }
+  return true;
 }
 
-static void relayLoop() {
+// One relay cycle for one device: flush queued sends, then poll in 2 s
+// slices up to a 20 s cycle budget. The slices are the sim's answer to the
+// firmware's single-task SEND delay (see config.h): a send queued
+// mid-poll is flushed before the next slice, so it goes out within ~2 s
+// instead of waiting out a full 20 s long-poll. The local dev server has
+// no request budget, so the extra requests cost nothing; the wire
+// protocol is unchanged (the DO still sees wait<=25 polls).
+static void relayCycleDevice(DeviceSim& d, const std::string& serverUrl, bool enabled) {
+  bool wifiOn = true;
+  std::string token;
+  {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    token = d.token;
+    wifiOn = d.wifiOn;
+  }
+
+  if (!wifiOn) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_OFF, "wifi off (sim toggle)");
+    return;
+  }
+  if (!enabled) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "relay disabled in sim");
+    return;
+  }
+  std::string host;
+  int port = 80;
+  std::string urlError;
+  if (!parseServerUrl(serverUrl, host, port, urlError)) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, urlError);
+    return;
+  }
+  if (token.empty()) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    setLinkLocked(d, LINK_WIFI, "no token: set MORSE_TOKEN_" + d.id + " or use the relay bar");
+    return;
+  }
+
+  const auto cycleStart = std::chrono::steady_clock::now();
+  for (;;) {
+    if (!tryFlushSend(d, host, port)) return;
+    if (!pollSlice(d, host, port, 2)) return;
+    if (!g_running) return;
+    // Loop: a send queued during the slice is flushed before the next one.
+    if (std::chrono::steady_clock::now() - cycleStart >= std::chrono::seconds(20)) break;
+  }
+}
+
+static void relayDeviceThread(DeviceSim& d, int startDelayMs) {
   // Stagger so dad and emma do not poll in lockstep.
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  std::this_thread::sleep_for(std::chrono::milliseconds(startDelayMs));
   while (g_running) {
-    std::string serverUrl = g_serverUrl;
-    bool enabled = g_relayEnabled.load();
-    relayCycleDevice(g_dad, serverUrl, enabled);
+    const auto t0 = std::chrono::steady_clock::now();
+    relayCycleDevice(d, g_serverUrl, g_relayEnabled.load());
     if (!g_running) break;
-    relayCycleDevice(g_emma, serverUrl, enabled);
-    for (int i = 0; i < 20 && g_running; i++)
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // A failed cycle returns at once; back off instead of spinning.
+    if (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2))
+      std::this_thread::sleep_for(std::chrono::seconds(2));
   }
 }
 
@@ -1217,12 +1273,6 @@ static void applyScene(DeviceSim& d, const std::string& name) {
     uiPattern(d.st, PREVIEW_DASH, now);
     uiProgress(d.st, true, now);
     return;
-  } else if (name == "hold-clear") {
-    setTextState(d.st, "SOS HELP");
-    selectDevice(d, link);
-    uiFull(d.st, now);
-    uiPattern(d.st, PREVIEW_CLEAR, now);
-    return;
   } else if (name == "hold-menu") {
     setTextState(d.st, "SOS HELP");
     selectDevice(d, link);
@@ -1331,25 +1381,6 @@ static std::vector<uint8_t> encodeBMP(DeviceSim& d) {
   return bmp;
 }
 
-static std::string jsonEscapeC(const char* s) {
-  std::string esc;
-  for (const char* p = s; *p; p++) {
-    char c = *p;
-    if (c == '"' || c == '\\') {
-      esc += '\\';
-      esc += c;
-    } else if (c == '\n') {
-      esc += "\\n";
-    } else if (c >= 32 && c < 127) {
-      esc += c;
-    } else {
-      char tmp[8];
-      snprintf(tmp, sizeof(tmp), "\\u%04x", (unsigned char)c);
-      esc += tmp;
-    }
-  }
-  return esc;
-}
 
 static const char* linkName(uint8_t link) {
   if (link == LINK_OK) return "online";
@@ -1359,7 +1390,7 @@ static const char* linkName(uint8_t link) {
 
 static std::string stateJSON(DeviceSim& d) {
   uint32_t now = vnow();
-  std::string esc = jsonEscapeC(d.st.text);
+  std::string esc = jsonEscapeStr(d.st.text);
   char letter = MORSE_NODES[d.st.node].letter ? MORSE_NODES[d.st.node].letter : '.';
   const char* modeStr = d.appMode == MODE_COMPOSE ? "compose"
                         : d.appMode == MODE_ACTIONS ? "actions"
@@ -1393,8 +1424,8 @@ static std::string stateJSON(DeviceSim& d) {
            d.msgMenuOpen ? "true" : "false", (unsigned)d.msgMenuSel,
            (unsigned)d.actionSel, (unsigned)link, linkName(link),
            wifiOn ? "true" : "false", token.empty() ? "false" : "true",
-           (long long)lastSeq, jsonEscapeC(g_serverUrl.c_str()).c_str(),
-           jsonEscapeC(relayError.c_str()).c_str());
+           (long long)lastSeq, jsonEscapeStr(g_serverUrl.c_str()).c_str(),
+           jsonEscapeStr(relayError.c_str()).c_str());
   std::string out(buf);
   // inbox: newest-first [{id,text}]
   out.pop_back(); // remove }
@@ -1405,14 +1436,14 @@ static std::string stateJSON(DeviceSim& d) {
     snprintf(ib, sizeof(ib), "{\"id\":%u,\"text\":\"",
              (unsigned)d.inbox[i].id);
     out += ib;
-    out += jsonEscapeC(d.inbox[i].text);
+    out += jsonEscapeStr(d.inbox[i].text);
     out += "\"}";
   }
   out += "],\"actions\":[";
   for (uint8_t i = 0; i < d.actionCount; i++) {
     if (i) out += ",";
     out += "\"";
-    out += jsonEscapeC(d.actionPtrs[i] ? d.actionPtrs[i] : "");
+    out += jsonEscapeStr(d.actionPtrs[i] ? d.actionPtrs[i] : "");
     out += "\"";
   }
   out += "]";
@@ -1421,7 +1452,7 @@ static std::string stateJSON(DeviceSim& d) {
     snprintf(mb, sizeof(mb), ",\"msgId\":%u,", (unsigned)d.inbox[d.msgIdx].id);
     out += mb;
     out += "\"msgText\":\"";
-    out += jsonEscapeC(d.inbox[d.msgIdx].text);
+    out += jsonEscapeStr(d.inbox[d.msgIdx].text);
     out += "\"";
   }
   out += "}";
@@ -1438,13 +1469,13 @@ static std::string relayJSON() {
              "\"hasToken\":%s,\"lastSeq\":%lld,\"error\":\"%s\"}",
              d.id.c_str(), d.wifiOn ? "true" : "false", (unsigned)link,
              linkName(link), d.token.empty() ? "false" : "true",
-             (long long)d.lastSeq, jsonEscapeC(d.relayError.c_str()).c_str());
+             (long long)d.lastSeq, jsonEscapeStr(d.relayError.c_str()).c_str());
     return std::string(b);
   };
   char head[512];
   snprintf(head, sizeof(head),
            "{\"url\":\"%s\",\"enabled\":%s,\"dad\":",
-           jsonEscapeC(g_serverUrl.c_str()).c_str(),
+           jsonEscapeStr(g_serverUrl.c_str()).c_str(),
            g_relayEnabled.load() ? "true" : "false");
   return std::string(head) + one(g_dad) + ",\"emma\":" + one(g_emma) + "}";
 }
@@ -1789,13 +1820,15 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::thread relayThread(relayLoop);
+  std::thread relayDad(relayDeviceThread, std::ref(g_dad), 0);
+  std::thread relayEmma(relayDeviceThread, std::ref(g_emma), 500);
 
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   if (srv < 0) {
     perror("socket");
     g_running = false;
-    relayThread.join();
+    relayDad.join();
+    relayEmma.join();
     return 1;
   }
   int opt = 1;
@@ -1807,13 +1840,15 @@ int main(int argc, char** argv) {
   if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
     perror("bind");
     g_running = false;
-    relayThread.join();
+    relayDad.join();
+    relayEmma.join();
     return 1;
   }
   if (listen(srv, 8) < 0) {
     perror("listen");
     g_running = false;
-    relayThread.join();
+    relayDad.join();
+    relayEmma.join();
     return 1;
   }
   printf("morse-code sim: http://localhost:%d/  (index: %s)\n", port,
@@ -1843,6 +1878,7 @@ int main(int argc, char** argv) {
   }
 
   close(srv);
-  relayThread.join();
+  relayDad.join();
+  relayEmma.join();
   return 0;
 }

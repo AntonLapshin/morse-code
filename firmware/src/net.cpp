@@ -358,7 +358,13 @@ static bool ensureWifi() {
 // 320 KB alongside the 108 KB display canvas (two 6 KB stacks starve mbedTLS
 // with "SSL - Memory allocation failed"; two 4 KB stacks overflow). The
 // trade-off is documented in config.h: a SEND queued while the long-poll is
-// in flight waits for that poll to return (up to NET_POLL_WAIT_S).
+// in flight waits for that poll to return (up to NET_POLL_WAIT_S, 5 s).
+// Aborting the in-flight poll from the UI task was considered and rejected:
+// stopping the TLS socket from another task risks freeing the mbedTLS
+// context while it is mid-read, and it cannot be proven without the board
+// in hand. Shortening the wait is the whole fix — it costs requests
+// (~17,280/day per board, still well under the 100,000/day free tier) and
+// changes nothing on the DO-duration side.
 static void netTask(void * /*arg*/) {
   s_prefs.begin("morse", false);
   s_prefsOpen = true;
@@ -442,9 +448,9 @@ static void netTask(void * /*arg*/) {
     }
 
     // --- RX: one long-poll --------------------------------------------------
-    // The first request after boot uses wait=0: a 20 s long-poll would keep
-    // the dot orange for 20 s even though the relay is reachable. Every later
-    // request long-polls so the Workers request budget stays low.
+    // The first request after boot uses wait=0: a full-length long-poll
+    // would keep the dot orange even though the relay is reachable. Every
+    // later request long-polls so the Workers request budget stays low.
     int waitS = firstPoll ? 0 : NET_POLL_WAIT_S;
     char path[64];
     snprintf(path, sizeof(path),

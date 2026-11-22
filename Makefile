@@ -5,7 +5,12 @@
 #   make upload-dad / make upload-emma   shortcuts (DEVICE fixed)
 #   make build [DEVICE=dad|emma]   compile-check only (no device needed)
 #   make monitor             serial log @ 115200 (Ctrl+C to exit)
-#   make check               verify toolchain + serial port
+#   make check               full readiness check (toolchain, libs, .env,
+#                            secrets.h, serial port, Worker health, login) —
+#                            run this first when something is broken; see
+#                            scripts/check.sh. No board or deploy needed:
+#                            a missing port / secrets.h / Worker / login
+#                            is a warning, not a failure.
 #   make secrets DEVICE=dad  generate firmware/src/secrets.h from .env
 #   make preview             render the UI to tools/preview/out/preview.png
 #   make sim [PORT=8077]       run the ESP32 display simulator (web UI)
@@ -61,7 +66,7 @@ help:
 	@echo "  make build [DEVICE=dad|emma]   compile-check only (no device needed)"
 	@echo "  make secrets DEVICE=dad       generate firmware/src/secrets.h from .env"
 	@echo "  make monitor [PORT=...]          serial log @ 115200 baud"
-	@echo "  make check                       verify arduino-cli core/libs + serial port"
+	@echo "  make check                       full readiness check (toolchain, .env, Worker health) — run first when something is broken"
 	@echo "  make preview                     render UI frames to a PNG (host-side)"
 	@echo "  make sim [PORT=8077]             ESP32 display simulator at http://localhost:8077/"
 	@echo "                                   (talks to the local Worker; run make worker-dev first)"
@@ -88,15 +93,7 @@ secrets:
 	./scripts/gen-secrets.py $(DEVICE) --force
 
 check:
-	@arduino-cli version
-	@arduino-cli core list | grep -q 'esp32:esp32' || \
-	  (echo "Missing esp32 core: arduino-cli core install esp32:esp32"; exit 1)
-	@arduino-cli lib list | grep -qi 'Adafruit ST7735 and ST7789' || \
-	  (echo "Missing ST7789 library: arduino-cli lib install 'Adafruit ST7735 and ST7789 Library'"; exit 1)
-	@arduino-cli lib list | grep -qi 'Adafruit GFX' || \
-	  (echo "Missing GFX library: arduino-cli lib install 'Adafruit GFX Library'"; exit 1)
-	@echo "PORT=$(PORT)"
-	@ls -l $(PORT) || (echo "No serial port at $(PORT). Plug in via USB data cable, then: ls /dev/ttyUSB* /dev/ttyACM*"; exit 1)
+	bash scripts/check.sh
 
 # Stage the sources into a sketch folder (same layout as build-arduino-cli.sh).
 # Always restages (phony): `make upload DEVICE=emma` regenerates secrets.h

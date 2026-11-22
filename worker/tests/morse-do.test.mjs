@@ -72,6 +72,18 @@ describe("send + poll (mirrors test_api.py)", () => {
     expect(response.data.truncated).toBe(false);
   });
 
+  it("test_long_poll_timeout_does_not_requery", async () => {
+    // A poll that waits out its deadline with no insert must query once:
+    // re-querying after each 5 s timeout slice would return the same
+    // empty result. (wait=1.1 spans the slice boundary logic without
+    // paying for a full 5 s slice in the test.)
+    const { relay, sql } = makeRelay();
+    const response = await poll(relay, "emma", { since: 0, wait: 1.1 });
+    expect(response.status).toBe(200);
+    expect(response.data.messages).toEqual([]);
+    expect(sql.fetchAfterCalls).toBe(1);
+  });
+
   it("test_since_skips_old_messages", async () => {
     const { relay } = makeRelay();
     const first = (await send(relay, "dad", "ONE", "dad-1-1")).data;

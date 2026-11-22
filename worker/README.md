@@ -87,10 +87,11 @@ authenticated `GET /api/v1/state` now.
 
 ## Free-tier limits
 
-- Requests: 100,000/day — a 20 s long-poll is ~4,320 requests/day per
-  connected device, fine for two boards. (At the old `wait=0` polling
-  it would have been ~43,200/day per device — that is why the firmware
-  and sim poll with `wait=20` now.)
+- Requests: 100,000/day — a 5 s long-poll is ~17,280 requests/day per
+  connected device (~34,560 for both boards), fine for two boards. (At
+  the old `wait=0` polling it would have been ~43,200/day per device —
+  that is why the firmware polls with `wait=5` now; the sim polls the
+  local dev server in 2 s slices, where requests are free.)
 - **Duration: 13,000 GB-s/day is the binding constraint.** A pending
   long-poll keeps the DO non-hibernatable, so it bills duration while a
   device is polling. 24 h of polling ≈ 10,800 GB-s — most of the daily
@@ -145,7 +146,7 @@ curl -s -X POST http://localhost:8787/api/v1/messages \
   -d '{"client_msg_id":"dad-1-1","text":"HELLO"}'
 curl -s -G http://localhost:8787/api/v1/messages \
   -H "Authorization: Bearer $TOKEN_EMMA" \
-  --data-urlencode since=0 --data-urlencode wait=20
+  --data-urlencode since=0 --data-urlencode wait=5
 curl -s http://localhost:8787/api/v1/state \
   -H "Authorization: Bearer $TOKEN_DAD"
 ```
@@ -190,8 +191,7 @@ would silently revert the names to those defaults. Dashboard alternative:
 Workers & Pages → morse-code → Settings → Variables → add
 `MORSE_DAD_NAME` / `MORSE_EMMA_NAME` as plain Variables (not Secrets).
 
-Dashboard half of the deploy (dash.cloudflare.com; also summarized in
-the root README): the custom domain must be a Cloudflare zone (DNS
+Dashboard half of the deploy (dash.cloudflare.com): the custom domain must be a Cloudflare zone (DNS
 managed by Cloudflare) in the same account as the Worker. After
 deploying, check Workers & Pages → morse-code for the deployment and
 version 0.2.0, and Workers & Pages → morse-code → Settings → Domains &

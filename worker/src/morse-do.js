@@ -263,14 +263,29 @@ export class MorseRelay {
     let fetched = { rows: [], truncated: false };
     // Same no-lost-wakeup shape as the FastAPI notifier: query, then
     // block only if empty, and re-query after every wake/timeout.
+    // `seen` is captured BEFORE each fetch: an insert between the snapshot
+    // and the fetch is in the fetch result, and an insert after it makes
+    // the waiter's immediate check (latest > seen) fire at once — so no
+    // wakeup is ever lost. (Passing the caller's `since` here would be
+    // wrong: the device's own sends make latest > since with an empty
+    // fetch, which would spin the loop until the deadline.)
+    // A wait that times out (no insert) cannot have changed anything, so
+    // re-querying after it would return the same empty result — wait again
+    // instead. Only a wake (waitForChange true) re-queries, and the
+    // in-loop touch is dropped too: fetch() already touched at request
+    // start and the post-loop touch covers the 45 s presence window for a
+    // poll that lasts at most 25 s.
+    let changed = true; // first pass must query
+    let seen = 0;
     for (;;) {
-      store.touch(this.sql, device, Date.now() / 1000);
-      const seen = store.latestSeq(this.sql);
-      fetched = store.fetchAfter(this.sql, device, since, limit);
-      if (fetched.rows.length > 0 || wait <= 0) break;
+      if (changed) {
+        seen = store.latestSeq(this.sql);
+        fetched = store.fetchAfter(this.sql, device, since, limit);
+        if (fetched.rows.length > 0 || wait <= 0) break;
+      }
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      await this.waitForChange(seen, Math.min(remaining, 5000));
+      changed = await this.waitForChange(seen, Math.min(remaining, 5000));
     }
 
     store.touch(this.sql, device, Date.now() / 1000);

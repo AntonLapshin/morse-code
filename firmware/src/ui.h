@@ -31,7 +31,6 @@ enum MorsePreview : uint8_t {
   PREVIEW_NONE    = 0,
   PREVIEW_DOT     = 1,
   PREVIEW_DASH    = 2,
-  PREVIEW_CLEAR   = 3, // legacy: long-hold clear (kept for old scenes)
   PREVIEW_ACTIONS = 4  // long hold armed: release opens the action menu
 };
 
@@ -53,6 +52,13 @@ enum ToastKind : uint8_t {
 };
 
 void uiSetLink(uint8_t link);
+
+// Device name shown top-right in the top strip ("DAD" / "EMMA"): set once
+// from DEVICE_NAME in secrets.h (firmware) or the sim device id. Drawn by
+// uiBadge() and uiMessageCard() next to the unread badge / page counter,
+// so it is visible on every screen. Stored truncated to 12 chars; an
+// empty name draws nothing and the badge keeps its old position.
+void uiSetDeviceName(const char* name);
 
 // One incoming message. The display owns a small ring; a message that has
 // been read is removed, so `unread == stored count`. `id` is unique and

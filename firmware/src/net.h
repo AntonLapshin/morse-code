@@ -18,7 +18,7 @@
 // otherwise talks through these queues; `loop()` drains them. A single task
 // is a memory decision, not a logic one: two TLS tasks do not fit next to
 // the 108 KB canvas on a 320 KB ESP32, so a SEND queued mid-poll waits for
-// that poll (up to NET_POLL_WAIT_S) — see config.h.
+// that poll (up to NET_POLL_WAIT_S, 5 s — see config.h).
 struct NetInbound {
   uint32_t seq;
   char text[MSG_TEXT_MAX + 1];

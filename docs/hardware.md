@@ -48,7 +48,7 @@ if the image is upside-down on your revision.
 | GPIO | 0 |
 | Active level | LOW (pressed) |
 | Pull-up | internal (`INPUT_PULLUP`) |
-| Functions | tap = dot, hold = dash, ≥1.5 s hold = clear |
+| Functions | tap = dot, hold = dash, ≥1.5 s hold = action menu (`SEND` / `CLEAR` / `READ n` / `CLOSE`) |
 
 GPIO0 is also the ESP32 **boot-strap** pin. The board's USB-serial auto-reset
 circuit uses it to enter the ROM bootloader while flashing. Consequences:
@@ -74,7 +74,8 @@ roughly 260 ms.
 
 This is why the app offers two software-only clear gestures:
 
-1. **Hold BOOT for at least 1.5 s** (the pattern row shows a red `CLEAR`).
+1. **Hold BOOT for at least 1.5 s** (the pattern row shows `MENU`) to open
+   the action menu, then pick `CLEAR` inside it.
 2. **Optional dedicated button** — see below.
 
 ### Optional clear button
@@ -103,7 +104,7 @@ Morse input is duration-based, not edge-based:
 press ──┬─────────────────────────────── release
         │← <220 ms → dot
         │← 220 ms … 1.5 s → dash
-        └← ≥1.5 s → clear (no symbol)
+        └← ≥1.5 s → action menu (commits any pending letter first)
 ```
 
 After the last symbol:
@@ -136,6 +137,8 @@ Constants live in `firmware/src/config.h`; the full table is in the
 
 ## Power and memory
 
-The app uses no WiFi and no JSON, so the image is small (about 323 KB of flash,
-24 KB of RAM in the arduino-cli build). Powering the board from any USB port is
-enough; the backlight at PWM 160 is the largest consumer.
+The app uses WiFi (TLS to the Cloudflare Worker) and hand-rolled JSON, so
+the image is larger than a bare trainer build — the WiFi/TLS stack plus
+the 108 KB display canvas in RAM are the bulk of it. Powering the board
+from any USB port is enough; the backlight at PWM 160 is the largest
+consumer.

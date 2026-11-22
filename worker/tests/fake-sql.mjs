@@ -8,6 +8,9 @@ export class FakeSql {
     this.devices = new Map(); // id -> { id, name, last_seen, last_read_seq }
     this.messages = []; // { seq, client_msg_id, from_device, to_device, text, created_at }
     this.nextSeq = 1;
+    // Counts fetchAfter queries (the SELECT ... WHERE seq > ? below), so
+    // tests can assert a long-poll that times out does not re-query.
+    this.fetchAfterCalls = 0;
   }
 
   exec(sql, ...params) {
@@ -84,6 +87,7 @@ export class FakeSql {
     if (
       s.startsWith("SELECT seq, client_msg_id, from_device, to_device, text, created_at FROM messages WHERE seq > ?")
     ) {
+      this.fetchAfterCalls++;
       const [since, deviceId, , limitPlus1] = params;
       const out = this.messages
         .filter(

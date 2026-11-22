@@ -87,6 +87,7 @@ static void render(const char* name, const MorseState& st, uint32_t now,
   snprintf(file, sizeof(file), "%s/%02d-%s.ppm", gOutDir.c_str(), gFrame++, name);
 
   uiFull(st, now);
+  uiBadge(0, now); // top strip: link dot + device name (no unread badge)
   if (preview != PREVIEW_NONE) uiPattern(st, preview, now);
   if (pressed) uiProgress(st, true, now);
   writePPM(file);
@@ -102,6 +103,7 @@ int main(int argc, char** argv) {
   display.setRotation(DISPLAY_ROTATION);
   uiBegin(&display);
   uiSetLink(LINK_OK); // preview assumes an online device (green dot)
+  uiSetDeviceName("DAD"); // one device in the preview; the name is top-right
 
   const uint32_t now = 10000;
 

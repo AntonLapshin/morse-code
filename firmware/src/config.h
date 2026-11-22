@@ -56,16 +56,22 @@
 
 // --- Cloudflare relay (0.2.0) ------------------------------------------------
 // The relay is a Cloudflare Worker + Durable Object at MORSE_SERVER_URL
-// (see worker/README.md). The long-poll wait is 20 s: at wait=0 the two
+// (see worker/README.md). The long-poll wait is 5 s: at wait=0 the two
 // boards would burn ~43,200 requests/day each against the Workers Free
-// 100,000/day limit; at wait=20 it is ~4,320/day each. Cost of the single
-// network task (an ESP32 RAM decision — two TLS tasks do not fit next to
-// the 108 KB canvas): a SEND queued while a long-poll is in flight waits
-// for that poll to return (up to NET_POLL_WAIT_S) before it is POSTed — the
-// UI shows QUEUED, then SENT. The first request after boot uses wait=0 so
-// the link dot turns green immediately. See worker/README.md for the
-// DO-duration side of the same trade.
-#define NET_POLL_WAIT_S   20
+// 100,000/day limit; at wait=5 it is ~17,280/day each (~34,560 for both
+// boards, well under the limit). The DO bills duration while a waiter is
+// pending, so shortening the wait does not change that side — a waiter is
+// held almost continuously either way. Cost of the single network task
+// (an ESP32 RAM decision — two TLS tasks do not fit next to the 108 KB
+// canvas): a SEND queued while a long-poll is in flight waits for that
+// poll to return (up to NET_POLL_WAIT_S) before it is POSTed — the UI
+// shows QUEUED, then SENT. 5 s is the worst case (typically ~2.5 s); the
+// 20 s wait this replaced made sends feel lost. Inbound messages are not
+// slowed by this: the DO wakes the poll the moment a message lands. The
+// first request after boot uses wait=0 so the link dot turns green
+// immediately. See worker/README.md for the DO-duration side of the
+// same trade.
+#define NET_POLL_WAIT_S   5
 
 // Protocol generation, persisted in NVS next to last_seq (see net.cpp).
 // The Worker + DO starts with an EMPTY database, so seq restarts at 1:
