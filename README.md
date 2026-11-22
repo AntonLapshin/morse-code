@@ -176,6 +176,14 @@ montages them with ImageMagick. The preview uses the *real* tree table and
 renderer, so a coordinate fix there is a coordinate fix on the device.
 Requirements: a C++17 compiler and ImageMagick (`magick`).
 
+`make check-name` runs a host-side regression check on the same renderer:
+it drives the redraw sequence `loop()` uses and asserts the top-right
+device name is present in the panel framebuffer after *every* redraw call.
+(It exists because the name once flashed: `uiFull()` flushed a nameless
+frame and only `uiBadge()` after it repainted the strip. The name is now
+part of the base frame `uiFull()` draws, so every flushed frame is
+complete.) It also runs as part of `make test`.
+
 ## Display simulator (live web UI, 2 devices + local Worker)
 
 `tools/sim/` is a two-ESP32-device simulation with the display: it links the

@@ -520,13 +520,24 @@ void uiAttach(Adafruit_ST7789* display) {
   tft = display;
 }
 
+// Defined with uiBadge() below; uiFull() needs it first.
+static void drawTopStrip();
+
 void uiFull(const MorseState& st, uint32_t now) {
   if (!gfx) return;
   gfx->fillScreen(COL_BG);
   gfx->setTextWrap(false);
 
   centeredText("MORSE CODE", TITLE_Y, 2, COL_TITLE, COL_BG, 1);
-  drawLinkDot();
+  // The top strip (link dot, device name, unread badge) is part of the
+  // base frame, not an overlay. It used to be drawn only by uiBadge(),
+  // which runs AFTER uiFull() flushes the whole frame — so every uiFull()
+  // (each dot/dash, each letter commit, each burst expiry, each menu/toast
+  // repaint) put a nameless frame on the panel for one full-frame SPI
+  // transfer, then the name reappeared: the constantly flashing name, with
+  // nothing else flashing (everything else is redrawn identically by
+  // uiFull()). Drawing the strip here makes every flushed frame complete.
+  drawTopStrip();
   drawTree(st, now);
 
   drawPattern(st, PREVIEW_NONE, now);
@@ -553,24 +564,34 @@ void uiProgress(const MorseState& st, bool pressed, uint32_t now) {
   flushRect(PROGRESS_Y, 3);
 }
 
-void uiBadge(uint8_t unread, uint32_t now) {
-  (void)now;
-  if (!gfx) return;
+// Unread count last shown by uiBadge(). uiFull() redraws the top strip
+// from it, so a full repaint never drops the badge or the name (see below).
+static uint8_t s_unread = 0;
+
+// The whole top strip (y 0..13) in the canvas: link dot, device name, and
+// the unread badge left of the name. Every function that repaints the top
+// of the screen must draw it through here — drawing it in only one place
+// is what keeps the name steady.
+static void drawTopStrip() {
   gfx->fillRect(0, 0, SCREEN_W, 14, COL_BG);
   drawLinkDot();
   int nameX = drawDeviceName(3);
-  if (unread == 0) {
-    flushRect(0, 14);
-    return;
-  }
+  if (s_unread == 0) return;
   char buf[16];
-  snprintf(buf, sizeof(buf), "%u NEW", unread);
+  snprintf(buf, sizeof(buf), "%u NEW", s_unread);
   int w = textAdvance(buf, 1, 0);
   // Badge sits left of the device name, red dot ahead of the text.
   int x = nameX - 10 - w;
   if (x < 20) x = 20; // never overwrite the link dot
   gfx->fillCircle(x - 6, 6, 4, COL_RED);
   drawText(buf, x, 3, 1, COL_WHITE, COL_BG);
+}
+
+void uiBadge(uint8_t unread, uint32_t now) {
+  (void)now;
+  if (!gfx) return;
+  s_unread = unread;
+  drawTopStrip();
   flushRect(0, 14);
 }
 

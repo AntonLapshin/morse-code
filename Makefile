@@ -13,6 +13,10 @@
 #                            is a warning, not a failure.
 #   make secrets DEVICE=dad  generate firmware/src/secrets.h from .env
 #   make preview             render the UI to tools/preview/out/preview.png
+#   make check-name            host-side regression check: the device name
+#                            must be present in every flushed frame (see
+#                            tools/preview/name-flash-check.cpp); also runs
+#                            as part of `make test`
 #   make sim [PORT=8077]       run the ESP32 display simulator (web UI)
 #   make sim-dump              headless simulator screenshots to tools/sim/out
 #   make worker-dev            local Cloudflare Worker dev server (port 8787)
@@ -45,7 +49,7 @@ SOURCES := firmware/src/main.cpp firmware/src/ui.cpp firmware/src/ui.h \
            firmware/src/morse.cpp firmware/src/morse.h firmware/src/config.h \
            firmware/src/net.cpp firmware/src/net.h
 
-.PHONY: help setup build upload upload-dad upload-emma monitor check preview sim sim-dump clean stage secrets \
+.PHONY: help setup build upload upload-dad upload-emma monitor check check-name preview sim sim-dump clean stage secrets \
         guard-not-root worker-dev worker-test worker-deploy worker-secrets worker-logs worker-login test
 
 # Never run build/upload as root: arduino-cli resolves the esp32 core from the
@@ -67,6 +71,7 @@ help:
 	@echo "  make secrets DEVICE=dad       generate firmware/src/secrets.h from .env"
 	@echo "  make monitor [PORT=...]          serial log @ 115200 baud"
 	@echo "  make check                       full readiness check (toolchain, .env, Worker health) — run first when something is broken"
+	@echo "  make check-name                  device-name regression check (name steady in every flushed frame)"
 	@echo "  make preview                     render UI frames to a PNG (host-side)"
 	@echo "  make sim [PORT=8077]             ESP32 display simulator at http://localhost:8077/"
 	@echo "                                   (talks to the local Worker; run make worker-dev first)"
@@ -94,6 +99,19 @@ secrets:
 
 check:
 	bash scripts/check.sh
+
+# Device-name regression check (tools/preview/name-flash-check.cpp): drives
+# the real renderer through the redraw sequence main.cpp's loop() uses and
+# asserts the top-right name is present in the panel framebuffer after
+# EVERY ui* call. A plain end-of-sequence snapshot would not catch the
+# original bug — the name only vanished from the intermediate frame that
+# uiFull() flushed before uiBadge() repainted the strip.
+check-name:
+	@mkdir -p tools/preview/build
+	c++ -std=c++17 -O2 -Wall -Wextra -Itools/preview -Ifirmware/src \
+	  tools/preview/name-flash-check.cpp firmware/src/ui.cpp firmware/src/morse.cpp \
+	  -o tools/preview/build/name-flash-check
+	./tools/preview/build/name-flash-check
 
 # Stage the sources into a sketch folder (same layout as build-arduino-cli.sh).
 # Always restages (phony): `make upload DEVICE=emma` regenerates secrets.h
@@ -183,7 +201,7 @@ worker-logs:
 worker-login:
 	cd worker && npx wrangler login
 
-test:
+test: check-name
 	npm test --prefix worker
 	npm run test:workers --prefix worker
 
