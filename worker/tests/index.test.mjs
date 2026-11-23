@@ -69,7 +69,7 @@ describe("worker fetch", () => {
   it("health needs no auth and returns ok", async () => {
     const res = await worker.fetch(new Request("http://test/api/v1/health"), GOOD_ENV, {});
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok", version: "0.2.0" });
+    expect(await res.json()).toEqual({ status: "ok", version: "0.2.1" });
   });
 
   it("health with a broken config is 500 config_error", async () => {

@@ -103,17 +103,25 @@ export function latestSeq(sql) {
   return found.length > 0 ? Number(found[0].seq) : 0;
 }
 
-/** Insert a message, or return the stored one on a duplicate.
- *  Returns { row, duplicate }. */
-export function insertMessage(sql, { fromDevice, clientMsgId, toDevice, text, createdAt }) {
-  const existing = rows(
+/** Find a message by the sender's client id, or null. Used by the
+ *  duplicate check in handleSend so a re-send can be answered without
+ *  consuming rate-limit budget (see insertMessage). */
+export function findMessage(sql, { fromDevice, clientMsgId }) {
+  const found = rows(
     sql.exec(
       `SELECT ${MESSAGE_COLUMNS} FROM messages WHERE from_device = ? AND client_msg_id = ?`,
       fromDevice,
       clientMsgId,
     ),
   );
-  if (existing.length > 0) return { row: existing[0], duplicate: true };
+  return found.length > 0 ? found[0] : null;
+}
+
+/** Insert a message, or return the stored one on a duplicate.
+ *  Returns { row, duplicate }. */
+export function insertMessage(sql, { fromDevice, clientMsgId, toDevice, text, createdAt }) {
+  const existing = findMessage(sql, { fromDevice, clientMsgId });
+  if (existing) return { row: existing, duplicate: true };
   sql.exec(
     "INSERT INTO messages (client_msg_id, from_device, to_device, text, created_at) VALUES (?, ?, ?, ?, ?)",
     clientMsgId,
@@ -122,15 +130,9 @@ export function insertMessage(sql, { fromDevice, clientMsgId, toDevice, text, cr
     text,
     createdAt,
   );
-  const inserted = rows(
-    sql.exec(
-      `SELECT ${MESSAGE_COLUMNS} FROM messages WHERE from_device = ? AND client_msg_id = ?`,
-      fromDevice,
-      clientMsgId,
-    ),
-  );
-  if (inserted.length === 0) throw new Error("inserted message disappeared");
-  return { row: inserted[0], duplicate: false };
+  const inserted = findMessage(sql, { fromDevice, clientMsgId });
+  if (!inserted) throw new Error("inserted message disappeared");
+  return { row: inserted, duplicate: false };
 }
 
 /** Up to `limit` messages addressed to `deviceId`, oldest first.

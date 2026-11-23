@@ -37,7 +37,7 @@ describe("worker + DO integration (real workerd SQLite)", () => {
   it("health, no auth", async () => {
     const res = await SELF.fetch("https://morse.test/api/v1/health");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok", version: "0.2.0" });
+    expect(await res.json()).toEqual({ status: "ok", version: "0.2.1" });
   });
 
   it("state shape and names come from Worker vars", async () => {

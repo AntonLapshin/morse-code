@@ -136,7 +136,7 @@ Smoke check against the dev server:
 
 ```bash
 curl -s http://localhost:8787/api/v1/health
-# {"status":"ok","version":"0.2.0"}
+# {"status":"ok","version":"0.2.1"}
 
 TOKEN_DAD=...   # MORSE_TOKEN_DAD from .env
 TOKEN_EMMA=...  # MORSE_TOKEN_EMMA from .env

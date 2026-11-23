@@ -14,7 +14,7 @@
 //   - Retention pruning runs on a DO alarm (hourly), not on every request.
 import * as store from "./store.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 const ONLINE_WINDOW_S = 45;
 const MAX_TEXT_BYTES = 512;
 const MAX_CLIENT_MSG_ID = 64;
@@ -202,13 +202,12 @@ export class MorseRelay {
       return this.err("validation_error", `text: must be at most ${MAX_TEXT_BYTES} bytes`, 400);
     }
 
-    if (!this.allowSend(device, now)) {
-      return this.err(
-        "rate_limited",
-        `at most ${SEND_RATE_LIMIT} messages per minute`,
-        429,
-      );
-    }
+    // Recipient validation and the duplicate check run BEFORE the rate
+    // limiter: a 400 for self/unknown recipient and a duplicate re-send
+    // (same client_msg_id, e.g. a retry after a lost response) must not
+    // burn one of the 20/minute slots — only a genuinely new, deliverable
+    // message consumes budget. (Live e2e 2026-11-23: 3×400 + 17 sends
+    // with 16 duplicates hit the 429 on the next valid send.)
     if (to !== FAMILY && !DEVICE_IDS.includes(to)) {
       return this.err(
         "unknown_recipient",
@@ -218,6 +217,29 @@ export class MorseRelay {
     }
     if (to === device) {
       return this.err("self_recipient", "cannot send to yourself", 400);
+    }
+    const existing = store.findMessage(this.sql, { fromDevice: device, clientMsgId });
+    if (existing) {
+      return jsonResponse(
+        {
+          seq: Number(existing.seq),
+          from: existing.from_device,
+          from_name: this.nameFor(device),
+          to: existing.to_device,
+          text: existing.text,
+          ts: Math.floor(Number(existing.created_at)),
+          duplicate: true,
+        },
+        200,
+      );
+    }
+
+    if (!this.allowSend(device, now)) {
+      return this.err(
+        "rate_limited",
+        `at most ${SEND_RATE_LIMIT} messages per minute`,
+        429,
+      );
     }
 
     const { row, duplicate } = store.insertMessage(this.sql, {

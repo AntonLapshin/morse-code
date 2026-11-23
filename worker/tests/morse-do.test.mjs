@@ -195,6 +195,55 @@ describe("rate limit", () => {
     // The other device is unaffected.
     expect((await send(relay, "emma", "OK", "emma-rate-0")).status).toBe(201);
   });
+
+  it("failed recipient checks do not consume budget", async () => {
+    const { relay } = makeRelay();
+    // Live e2e 2026-11-23: 3 invalid-recipient 400s counted toward the
+    // 20/minute budget and pushed the next valid send to 429.
+    for (let i = 0; i < 20; i++) {
+      const self = await send(relay, "dad", "ME", `dad-bad-${i}`, "dad");
+      expect(self.status).toBe(400);
+      expect(self.data.error).toBe("self_recipient");
+    }
+    const unknown = await send(relay, "dad", "GHOST", "dad-bad-x", "mallory");
+    expect(unknown.status).toBe(400);
+    expect(unknown.data.error).toBe("unknown_recipient");
+    const ok = await send(relay, "dad", "STILL OK", "dad-bad-ok");
+    expect(ok.status).toBe(201);
+  });
+
+  it("duplicate re-sends do not consume budget", async () => {
+    const { relay } = makeRelay();
+    const first = await send(relay, "dad", "ONCE", "dad-dup-1");
+    expect(first.status).toBe(201);
+    // A retry after a lost response re-sends the same client_msg_id.
+    for (let i = 0; i < 20; i++) {
+      const retry = await send(relay, "dad", "ONCE", "dad-dup-1");
+      expect(retry.status).toBe(200);
+      expect(retry.data.duplicate).toBe(true);
+      expect(retry.data.seq).toBe(first.data.seq);
+    }
+    const ok = await send(relay, "dad", "STILL OK", "dad-dup-2");
+    expect(ok.status).toBe(201);
+  });
+
+  it("live e2e mix: 3 bad sends + 17 sends with 16 duplicates stays under the limit", async () => {
+    const { relay } = makeRelay();
+    expect((await send(relay, "dad", "ME", "mix-self-1", "dad")).status).toBe(400);
+    expect((await send(relay, "dad", "ME", "mix-self-2", "dad")).status).toBe(400);
+    expect((await send(relay, "dad", "GHOST", "mix-unknown", "mallory")).status).toBe(400);
+    const first = await send(relay, "dad", "HELLO", "mix-1");
+    expect(first.status).toBe(201);
+    for (let i = 0; i < 16; i++) {
+      const retry = await send(relay, "dad", "HELLO", "mix-1");
+      expect(retry.status).toBe(200);
+      expect(retry.data.duplicate).toBe(true);
+    }
+    // Before the fix this exact sequence consumed all 20 slots and the
+    // next valid send returned 429.
+    const ok = await send(relay, "dad", "NEXT", "mix-2");
+    expect(ok.status).toBe(201);
+  });
 });
 
 describe("names and retention", () => {
