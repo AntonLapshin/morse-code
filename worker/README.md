@@ -68,6 +68,9 @@ Error bodies keep the old relay's shape: `{error, detail}`.
 sent again). `to` defaults to `"family"`; `to` must be a known device
 id or `"family"` (`400` otherwise, `400` for sending to yourself).
 Text is trimmed; empty / whitespace-only or over 512 bytes is `400`.
+The boards display at most 96 characters per message (`MSG_TEXT_MAX` in
+`firmware/src/config.h`), so a longer accepted text is truncated on
+receipt, not rejected.
 The sender's own messages are never returned by the poll; the POST
 response is its confirmation.
 
@@ -79,7 +82,9 @@ than `limit` messages are new, the newest `limit` are returned with
 `peer_online` is true if any other device has been seen in the last
 45 s. `POST /api/v1/ack` `{upto_seq}` sets
 `last_read_seq = max(last_read_seq, upto_seq)` and returns the new
-unread count. Sends are rate-limited to 20/minute per device (`429`).
+unread count. Sends are rate-limited to 20 new messages/minute per
+device (`429`); a rejected send and a duplicate re-send do not consume
+budget (see `handleSend` in `src/morse-do.js`).
 
 One intentional difference from the laptop relay: `/health` returns
 `{status: "ok", version}` only — no `latest_seq`. That number lives on
